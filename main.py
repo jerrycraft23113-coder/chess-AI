@@ -1,0 +1,162 @@
+"""
+Chess Machine Learning Project - Main Entry Point
+"""
+
+import argparse
+import os
+
+
+def main():
+    """Main entry point for the chess ML project."""
+    parser = argparse.ArgumentParser(
+        description='Chess Machine Learning Project',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train the model (supervised learning)
+  python main.py train
+  
+  # Train using RL (self-play)
+  python main.py train-rl --games 100
+  
+  # Play against AI in console (AI plays black)
+  python main.py play
+  
+  # Play against AI with GUI
+  python main.py gui
+  
+  # Play with GUI (AI plays white)
+  python main.py gui --ai-color white
+  
+  # Play with custom model and depth
+  python main.py gui --model models/chess_model.pth --depth 3
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Train command (supervised)
+    train_parser = subparsers.add_parser('train', help='Train the chess neural network (supervised learning)')
+    train_parser.add_argument('--data', type=str, default='data/training_data.npz',
+                              help='Path to training data file (default: data/training_data.npz)')
+    train_parser.add_argument('--epochs', type=int, default=20,
+                              help='Number of training epochs (default: 20, use <= 0 for infinite)')
+    train_parser.add_argument('--batch-size', type=int, default=32,
+                              help='Batch size (default: 32)')
+    train_parser.add_argument('--lr', type=float, default=0.001,
+                              help='Learning rate (default: 0.001)')
+    train_parser.add_argument('--use-cpu', action='store_true', default=True,
+                              help='Force CPU usage (default: True)')
+    train_parser.add_argument('--generate-data', action='store_true',
+                              help='Generate random training data instead of loading from file')
+    train_parser.add_argument('--num-positions', type=int, default=5000,
+                              help='Number of positions to generate if using --generate-data (default: 5000)')
+    
+    # Train RL command
+    train_rl_parser = subparsers.add_parser('train-rl', help='Train the chess neural network using RL (self-play)')
+    train_rl_parser.add_argument('--games', type=int, default=100,
+                                 help='Number of self-play games (default: 100, use <= 0 for infinite)')
+    train_rl_parser.add_argument('--batch-size', type=int, default=10,
+                                 help='Batch size for training (default: 10)')
+    train_rl_parser.add_argument('--lr', type=float, default=0.001,
+                                help='Learning rate (default: 0.001)')
+    train_rl_parser.add_argument('--model-type', choices=['value', 'policy'], default='value',
+                                help='Model type: value or policy (default: value)')
+    train_rl_parser.add_argument('--load-model', type=str, default=None,
+                                help='Path to load existing model')
+    train_rl_parser.add_argument('--save-interval', type=int, default=10,
+                                help='Save model every N games (default: 10)')
+    
+    # Play command (console)
+    play_parser = subparsers.add_parser('play', help='Play chess against the AI (console mode)')
+    play_parser.add_argument('--ai-color', choices=['white', 'black'], default='black',
+                            help='Color the AI plays (default: black)')
+    play_parser.add_argument('--depth', type=int, default=2,
+                            help='AI search depth (default: 2)')
+    play_parser.add_argument('--model', type=str, default='models/chess_model.pth',
+                            help='Path to trained model (default: models/chess_model.pth)')
+    play_parser.add_argument('--classical-weight', type=float, default=0.3,
+                            help='Weight for classical evaluation vs neural net (0-1, default: 0.3)')
+    
+    # GUI command
+    gui_parser = subparsers.add_parser('gui', help='Play chess against the AI (GUI mode)')
+    gui_parser.add_argument('--ai-color', choices=['white', 'black'], default='black',
+                           help='Color the AI plays (default: black)')
+    gui_parser.add_argument('--depth', type=int, default=2,
+                           help='AI search depth (default: 2)')
+    gui_parser.add_argument('--model', type=str, default='models/chess_model.pth',
+                           help='Path to trained model (default: models/chess_model.pth)')
+    gui_parser.add_argument('--classical-weight', type=float, default=0.3,
+                           help='Weight for classical evaluation vs neural net (0-1, default: 0.3)')
+    
+    args = parser.parse_args()
+    
+    if args.command == 'train':
+        print("Starting training (supervised learning)...")
+        from train import run_training
+        run_training(
+            data_path=args.data,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            use_cpu=args.use_cpu,
+            generate_data=args.generate_data,
+            num_positions=args.num_positions,
+        )
+    elif args.command == 'train-rl':
+        print("Starting RL training (self-play)...")
+        from train_rl import train_rl, ChessCNN, ChessPolicyNetwork
+        import torch
+        
+        # Device selection
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Create model
+        if args.model_type == 'policy':
+            model = ChessPolicyNetwork(hidden_size=256)
+            print("Using Policy Network")
+        else:
+            model = ChessCNN(hidden_size=256)
+            print("Using Value Network")
+        
+        # Load existing model if provided
+        if args.load_model and os.path.exists(args.load_model):
+            try:
+                model.load_state_dict(torch.load(args.load_model, map_location=device))
+                print(f"Loaded model from {args.load_model}")
+            except Exception as e:
+                print(f"Warning: Could not load model: {e}")
+        
+        train_rl(
+            model=model,
+            num_games=args.games,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            device=device,
+            save_interval=args.save_interval
+        )
+    elif args.command == 'play':
+        print("Starting chess game (console mode)...")
+        from play_chess import play_game
+        play_game(
+            ai_color=args.ai_color,
+            ai_depth=args.depth,
+            model_path=args.model,
+            classical_weight=args.classical_weight
+        )
+    elif args.command == 'gui':
+        print("Starting chess game (GUI mode)...")
+        from chess_gui import ChessGUI
+        app = ChessGUI(
+            ai_color=args.ai_color,
+            ai_depth=args.depth,
+            model_path=args.model if args.model else None,
+            classical_weight=args.classical_weight
+        )
+        app.run()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

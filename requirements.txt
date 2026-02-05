@@ -1,0 +1,6 @@
+torch
+numpy
+python-chess
+customtkinter
+Pillow
+h5py
