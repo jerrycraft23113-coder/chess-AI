@@ -160,10 +160,11 @@ class ChessAI:
 
     def _quiesce(self, bb, alpha, beta, qdepth=0):
         self.nodes += 1
-        if self.nodes & 4095 == 0:
+        if (self.nodes & 4095) == 0:
             if self.time_limit > 0 and time.time() - self.start_time >= self.time_limit:
                 self.time_up = True
                 return 0.0
+            time.sleep(0)
 
         # Stand-pat
         score = _eval_fast(bb)
@@ -223,11 +224,12 @@ class ChessAI:
     def _negamax(self, bb, depth, alpha, beta, do_null=True, prev_move=None):
         self.nodes += 1
 
-        # Time check every 4096 nodes
-        if self.nodes & 4095 == 0:
+        # Time check every 4096 nodes + yield GIL so GUI stays responsive
+        if (self.nodes & 4095) == 0:
             if self.time_limit > 0 and time.time() - self.start_time >= self.time_limit:
                 self.time_up = True
                 return 0.0
+            time.sleep(0)
 
         # Check extension
         in_check = bb.is_check()
@@ -586,6 +588,26 @@ class ChessAI:
                 break
 
         return best_score
+
+
+# ── Subprocess entry point (no Tk imports → safe for multiprocessing) ──
+
+def ai_search_process(fen, depth, classical_weight, time_limit, result_queue):
+    """Run AI search in a separate process so GUI timer stays smooth.
+    
+    This function is the target for multiprocessing.Process.
+    It has its own GIL and cannot block the GUI main thread.
+    """
+    try:
+        board = ChessBoard()
+        board.board = chess.Board(fen)
+        ai = ChessAI(depth=depth, classical_weight=classical_weight,
+                      time_limit=time_limit)
+        move = ai.get_best_move(board)
+        result_queue.put(move.uci() if move else None)
+    except Exception as e:
+        print(f"AI subprocess error: {e}")
+        result_queue.put(None)
 
 
 # ── CLI Interface ──────────────────────────────────────────────

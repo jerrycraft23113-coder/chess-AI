@@ -16,13 +16,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import chess
 from typing import Optional, Tuple, Dict
-import threading
+import multiprocessing as mp
+from queue import Empty
 import time
 from pathlib import Path
 from PIL import Image, ImageTk
 
 from chess_board import ChessBoard
-from play_chess import ChessAI
+from play_chess import ChessAI, ai_search_process
 
 
 class ChessGUI:
@@ -81,6 +82,9 @@ class ChessGUI:
         self.timer_running = False
         self.last_tick_time = None
         self.timer_after_id = None
+        # Track whose clock is running independently of board state
+        # (board.turn gets flipped by AI search thread during push/pop)
+        self._clock_color = chess.WHITE
         
         # Initialize image variables (will be loaded after root window is created)
         self.images_dir = Path(__file__).parent / 'images'
@@ -104,6 +108,16 @@ class ChessGUI:
             self.root.resizable(False, False)
             self.root.configure(bg='white')
             self.use_ctk = False
+        
+        # Pre-create cached fonts for timer (plain tk fonts - fast to switch)
+        self._timer_font_bold = ('Consolas', 20, 'bold')
+        self._timer_font_normal = ('Consolas', 20)
+        self._last_white_text = None
+        self._last_black_text = None
+        self._last_white_bold = None
+        self._last_black_bold = None
+        self._last_white_color = None
+        self._last_black_color = None
         
         # Load images AFTER root window is created
         self.load_images()
@@ -305,25 +319,28 @@ class ChessGUI:
             )
             self.info_label.pack(pady=8, padx=18)
 
-            # Timer display
-            timer_frame = ctk.CTkFrame(info_frame, fg_color='transparent')
+            # Timer display - use plain tk widgets for fast updates
+            timer_frame = tk.Frame(info_frame, bg='white', bd=2, relief=tk.GROOVE,
+                                   padx=12, pady=8)
             timer_frame.pack(pady=8, padx=18, fill=tk.X)
 
-            self.white_timer_label = ctk.CTkLabel(
+            self.white_timer_label = tk.Label(
                 timer_frame,
-                text="♔ White   10:00",
-                font=ctk.CTkFont(size=22, weight='bold'),
-                text_color=self.TEXT_COLOR
+                text="\u2654 White   10:00",
+                font=('Consolas', 20, 'bold'),
+                bg='white', fg=self.TEXT_COLOR,
+                anchor='w'
             )
-            self.white_timer_label.pack(pady=4, anchor=tk.W)
+            self.white_timer_label.pack(pady=(4, 2), padx=8, anchor=tk.W, fill=tk.X)
 
-            self.black_timer_label = ctk.CTkLabel(
+            self.black_timer_label = tk.Label(
                 timer_frame,
-                text="♚ Black   10:00",
-                font=ctk.CTkFont(size=22),
-                text_color=self.LABEL_COLOR
+                text="\u265a Black   10:00",
+                font=('Consolas', 20),
+                bg='white', fg=self.LABEL_COLOR,
+                anchor='w'
             )
-            self.black_timer_label.pack(pady=4, anchor=tk.W)
+            self.black_timer_label.pack(pady=(2, 4), padx=8, anchor=tk.W, fill=tk.X)
 
             # Controls
             control_frame = ctk.CTkFrame(info_frame, fg_color='transparent')
@@ -409,23 +426,28 @@ class ChessGUI:
             self.info_label = ttk.Label(info_frame, text="", font=('Arial', 18), wraplength=400)
             self.info_label.pack(pady=8)
 
-            # Timer display
-            timer_frame = ttk.Frame(info_frame)
-            timer_frame.pack(pady=8, fill=tk.X)
+            # Timer display - bordered container
+            timer_frame = tk.Frame(info_frame, bg='white', bd=2, relief=tk.GROOVE,
+                                   padx=12, pady=8)
+            timer_frame.pack(pady=8, padx=18, fill=tk.X)
 
-            self.white_timer_label = ttk.Label(
+            self.white_timer_label = tk.Label(
                 timer_frame,
                 text="♔ White   10:00",
-                font=('Arial', 20, 'bold')
+                font=self._timer_font_bold,
+                bg='white', fg=self.TEXT_COLOR,
+                anchor='w'
             )
-            self.white_timer_label.pack(pady=4, anchor=tk.W)
+            self.white_timer_label.pack(pady=4, anchor=tk.W, fill=tk.X)
 
-            self.black_timer_label = ttk.Label(
+            self.black_timer_label = tk.Label(
                 timer_frame,
                 text="♚ Black   10:00",
-                font=('Arial', 20)
+                font=self._timer_font_normal,
+                bg='white', fg=self.LABEL_COLOR,
+                anchor='w'
             )
-            self.black_timer_label.pack(pady=4, anchor=tk.W)
+            self.black_timer_label.pack(pady=4, anchor=tk.W, fill=tk.X)
 
             # Separator
             ttk.Separator(info_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
@@ -720,6 +742,8 @@ class ChessGUI:
     def make_move(self, move: chess.Move):
         """Make a move on the board."""
         if self.board.make_move(move):
+            # Record whose clock should now be ticking (safe from AI search race)
+            self._clock_color = self.board.board.turn
             # Start timer on first move, keep ticking for subsequent moves
             if not self.timer_running and not self.game_timed_out:
                 self._start_timer()
@@ -727,7 +751,7 @@ class ChessGUI:
         return False
     
     def make_ai_move(self):
-        """Make AI move in a separate thread."""
+        """Start AI search in a separate PROCESS (not thread) to avoid GIL blocking timer."""
         if self.is_ai_thinking or self.board.is_game_over() or self.game_timed_out:
             return
         
@@ -740,16 +764,46 @@ class ChessGUI:
         self.is_ai_thinking = True
         self.update_display()
         
-        # Run AI thinking in a separate thread to avoid freezing GUI
-        def ai_thread():
-            move = self.ai.get_best_move(self.board)
-            if move:
-                self.root.after(0, lambda: self.complete_ai_move(move))
-            else:
-                self.root.after(0, lambda: self.complete_ai_move(None))
+        # Send board FEN to a separate process — own GIL, can't block GUI
+        fen = self.board.board.fen()
+        self._ai_result_queue = mp.Queue()
+        self._ai_process = mp.Process(
+            target=ai_search_process,
+            args=(fen, self.ai.depth, self.classical_weight,
+                  self.ai.time_limit, self._ai_result_queue),
+            daemon=True
+        )
+        self._ai_process.start()
+        self._poll_ai_result()
+    
+    def _poll_ai_result(self):
+        """Poll for AI result every 50ms without blocking the main thread."""
+        if self.game_timed_out:
+            self._cleanup_ai_process()
+            self.is_ai_thinking = False
+            self.update_display()
+            return
         
-        thread = threading.Thread(target=ai_thread, daemon=True)
-        thread.start()
+        try:
+            result = self._ai_result_queue.get_nowait()
+            self._cleanup_ai_process()
+            if result:
+                move = chess.Move.from_uci(result)
+                self.complete_ai_move(move)
+            else:
+                self.complete_ai_move(None)
+        except Empty:
+            self.root.after(50, self._poll_ai_result)
+    
+    def _cleanup_ai_process(self):
+        """Terminate and clean up the AI subprocess."""
+        if hasattr(self, '_ai_process') and self._ai_process is not None:
+            if self._ai_process.is_alive():
+                self._ai_process.terminate()
+                self._ai_process.join(timeout=2)
+            self._ai_process = None
+        if hasattr(self, '_ai_result_queue'):
+            self._ai_result_queue = None
     
     def complete_ai_move(self, move: Optional[chess.Move]):
         """Complete AI move on main thread."""
@@ -777,16 +831,17 @@ class ChessGUI:
     
     def new_game(self):
         """Start a new game."""
-        if self.is_ai_thinking:
-            messagebox.showinfo("New Game", "Please wait for AI to finish thinking.")
-            return
-
         if messagebox.askyesno("New Game", "Start a new game?"):
+            # Kill AI process if still running
+            if self.is_ai_thinking:
+                self._cleanup_ai_process()
+                self.is_ai_thinking = False
             # Stop and reset timer
             self._stop_timer()
             self.white_time = self.time_limit
             self.black_time = self.time_limit
             self.game_timed_out = False
+            self._clock_color = chess.WHITE
 
             self.board = ChessBoard()
             self.selected_square = None
@@ -794,6 +849,13 @@ class ChessGUI:
             self.is_ai_thinking = False
             # Clear AI transposition table for the new game
             self.ai.transposition_table.clear()
+            # Reset cached timer state so display refreshes fully
+            self._last_white_text = None
+            self._last_black_text = None
+            self._last_white_bold = None
+            self._last_black_bold = None
+            self._last_white_color = None
+            self._last_black_color = None
             self._update_timer_display()
             self.update_display()
 
@@ -969,15 +1031,16 @@ class ChessGUI:
 
     def _tick_timer(self):
         """Tick the chess clock (called every 100ms)."""
-        if not self.timer_running or self.board.is_game_over() or self.game_timed_out:
+        if not self.timer_running or self.game_timed_out:
             return
 
         now = time.time()
         elapsed = now - self.last_tick_time
         self.last_tick_time = now
 
-        # Deduct from current player's clock
-        if self.board.get_turn() == chess.WHITE:
+        # Use _clock_color (set on actual moves) instead of board.get_turn()
+        # because the AI search thread temporarily flips board.turn via push/pop
+        if self._clock_color == chess.WHITE:
             self.white_time -= elapsed
             if self.white_time <= 0:
                 self.white_time = 0
@@ -1003,37 +1066,47 @@ class ChessGUI:
         return f"{mins:02d}:{secs:02d}"
 
     def _update_timer_display(self):
-        """Update timer labels with current times."""
+        """Update timer labels with current times.
+        
+        Uses plain tk.Label (not CTkLabel) with cached state to skip
+        unnecessary reconfigurations. Only updates what actually changed.
+        """
         white_str = f"\u2654 White   {self._format_time(self.white_time)}"
         black_str = f"\u265a Black   {self._format_time(self.black_time)}"
 
-        is_white_turn = self.board.get_turn() == chess.WHITE
+        is_white_turn = self._clock_color == chess.WHITE
         white_low = self.white_time < 30
         black_low = self.black_time < 30
 
-        if self.use_ctk:
-            # Active player bold, inactive normal
-            self.white_timer_label.configure(
-                text=white_str,
-                font=ctk.CTkFont(size=22, weight='bold' if is_white_turn else 'normal'),
-                text_color='#e74c3c' if white_low else (self.TEXT_COLOR if is_white_turn else self.LABEL_COLOR)
-            )
-            self.black_timer_label.configure(
-                text=black_str,
-                font=ctk.CTkFont(size=22, weight='bold' if not is_white_turn else 'normal'),
-                text_color='#e74c3c' if black_low else (self.TEXT_COLOR if not is_white_turn else self.LABEL_COLOR)
-            )
-        else:
+        white_bold = is_white_turn
+        black_bold = not is_white_turn
+        white_color = '#e74c3c' if white_low else (self.TEXT_COLOR if is_white_turn else self.LABEL_COLOR)
+        black_color = '#e74c3c' if black_low else (self.TEXT_COLOR if not is_white_turn else self.LABEL_COLOR)
+
+        # Only call .config() when values actually change (plain tk.Label is fast)
+        if white_str != self._last_white_text:
+            self.white_timer_label.config(text=white_str)
+            self._last_white_text = white_str
+        if black_str != self._last_black_text:
+            self.black_timer_label.config(text=black_str)
+            self._last_black_text = black_str
+
+        if white_bold != self._last_white_bold:
             self.white_timer_label.config(
-                text=white_str,
-                font=('Arial', 20, 'bold' if is_white_turn else 'normal'),
-                foreground='#e74c3c' if white_low else ''
+                font=self._timer_font_bold if white_bold else self._timer_font_normal
             )
+            self._last_white_bold = white_bold
+        if black_bold != self._last_black_bold:
             self.black_timer_label.config(
-                text=black_str,
-                font=('Arial', 20, 'bold' if not is_white_turn else 'normal'),
-                foreground='#e74c3c' if black_low else ''
+                font=self._timer_font_bold if black_bold else self._timer_font_normal
             )
+            self._last_black_bold = black_bold
+        if white_color != self._last_white_color:
+            self.white_timer_label.config(fg=white_color)
+            self._last_white_color = white_color
+        if black_color != self._last_black_color:
+            self.black_timer_label.config(fg=black_color)
+            self._last_black_color = black_color
 
     def _handle_timeout(self, color):
         """Handle when a player runs out of time."""
@@ -1080,4 +1153,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
