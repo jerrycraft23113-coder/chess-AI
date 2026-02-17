@@ -253,8 +253,8 @@ def main():
                        help='Batch size (default: 32)')
     parser.add_argument('--lr', type=float, default=0.001,
                        help='Learning rate (default: 0.001)')
-    parser.add_argument('--use-cpu', action='store_true', default=True,
-                       help='Force CPU usage (default: True)')
+    parser.add_argument('--use-cpu', action='store_true',
+                       help='Force CPU usage (default: auto-detect GPU)')
     
     args = parser.parse_args()
     

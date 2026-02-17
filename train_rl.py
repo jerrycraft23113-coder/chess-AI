@@ -76,24 +76,28 @@ class SelfPlayAgent:
                 # For simplicity, use greedy selection
                 best_move = None
                 best_value = float('-inf') if board.get_turn() else float('inf')
-                
+
                 for move in legal_moves:
                     board_copy = board.copy()
                     board_copy.make_move(move)
-                    
+
                     board_array = board_copy.board_to_array()
                     board_tensor = torch.FloatTensor(board_array).unsqueeze(0)
                     board_tensor = board_tensor.permute(0, 3, 1, 2)
-                    
+
+                    # Model outputs evaluation from white's perspective
                     value = self.model(board_tensor).item()
-                    if not board_copy.get_turn():
+
+                    # We want the best value from the CURRENT player's perspective
+                    # If current player is black, negate the white-perspective value
+                    if not board.get_turn():
                         value = -value
-                    
-                    if board.get_turn():
+
+                    if board.get_turn():  # White is maximizing
                         if value > best_value:
                             best_value = value
                             best_move = move
-                    else:
+                    else:  # Black is minimizing (from white's perspective)
                         if value < best_value:
                             best_value = value
                             best_move = move
@@ -357,13 +361,12 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
                         positions_tensor = torch.FloatTensor(np.array(all_positions)).to(device)
                         positions_tensor = positions_tensor.permute(0, 3, 1, 2)
                         rewards_tensor = torch.FloatTensor(all_rewards).to(device).unsqueeze(1)
-                        
+
                         # Debug: print reward stats
                         reward_mean = rewards_tensor.mean().item()
                         reward_std = rewards_tensor.std().item()
                         print(f"    Positions: {len(all_positions)}, Rewards: mean={reward_mean:.4f}, std={reward_std:.4f}")
-                        
-                        optimizer.zero_grad()
+
                         predictions = model(positions_tensor)
                         loss = F.mse_loss(predictions, rewards_tensor)
                     else:

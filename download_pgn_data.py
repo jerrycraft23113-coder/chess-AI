@@ -11,8 +11,6 @@ from pathlib import Path
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 
 
 def download_file(url: str, output_path: str, timeout: int = 30) -> bool:

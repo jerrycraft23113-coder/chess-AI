@@ -45,12 +45,10 @@ Examples:
                               help='Batch size (default: 32)')
     train_parser.add_argument('--lr', type=float, default=0.001,
                               help='Learning rate (default: 0.001)')
-    train_parser.add_argument('--use-cpu', action='store_true', default=True,
-                              help='Force CPU usage (default: True)')
-    train_parser.add_argument('--generate-data', action='store_true',
-                              help='Generate random training data instead of loading from file')
-    train_parser.add_argument('--num-positions', type=int, default=5000,
-                              help='Number of positions to generate if using --generate-data (default: 5000)')
+    train_parser.add_argument('--use-cpu', action='store_true',
+                              help='Force CPU usage (default: auto-detect GPU)')
+    train_parser.add_argument('--use-gpu', action='store_true',
+                              help='Force GPU usage if available')
     
     # Train RL command
     train_rl_parser = subparsers.add_parser('train-rl', help='Train the chess neural network using RL (self-play)')
@@ -71,23 +69,23 @@ Examples:
     play_parser = subparsers.add_parser('play', help='Play chess against the AI (console mode)')
     play_parser.add_argument('--ai-color', choices=['white', 'black'], default='black',
                             help='Color the AI plays (default: black)')
-    play_parser.add_argument('--depth', type=int, default=2,
-                            help='AI search depth (default: 2)')
+    play_parser.add_argument('--depth', type=int, default=5,
+                            help='AI search depth (default: 5)')
     play_parser.add_argument('--model', type=str, default='models/chess_model.pth',
                             help='Path to trained model (default: models/chess_model.pth)')
-    play_parser.add_argument('--classical-weight', type=float, default=0.3,
-                            help='Weight for classical evaluation vs neural net (0-1, default: 0.3)')
-    
+    play_parser.add_argument('--classical-weight', type=float, default=0.7,
+                            help='Weight for classical evaluation vs neural net (0-1, default: 0.7)')
+
     # GUI command
     gui_parser = subparsers.add_parser('gui', help='Play chess against the AI (GUI mode)')
     gui_parser.add_argument('--ai-color', choices=['white', 'black'], default='black',
                            help='Color the AI plays (default: black)')
-    gui_parser.add_argument('--depth', type=int, default=2,
-                           help='AI search depth (default: 2)')
+    gui_parser.add_argument('--depth', type=int, default=5,
+                           help='AI search depth (default: 5)')
     gui_parser.add_argument('--model', type=str, default='models/chess_model.pth',
                            help='Path to trained model (default: models/chess_model.pth)')
-    gui_parser.add_argument('--classical-weight', type=float, default=0.3,
-                           help='Weight for classical evaluation vs neural net (0-1, default: 0.3)')
+    gui_parser.add_argument('--classical-weight', type=float, default=0.7,
+                           help='Weight for classical evaluation vs neural net (0-1, default: 0.7)')
     
     args = parser.parse_args()
     
@@ -100,8 +98,6 @@ Examples:
             batch_size=args.batch_size,
             lr=args.lr,
             use_cpu=args.use_cpu,
-            generate_data=args.generate_data,
-            num_positions=args.num_positions,
         )
     elif args.command == 'train-rl':
         print("Starting RL training (self-play)...")

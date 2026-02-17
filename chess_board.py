@@ -49,7 +49,7 @@ class ChessBoard:
         try:
             move = chess.Move.from_uci(uci)
             return self.make_move(move)
-        except:
+        except (ValueError, chess.InvalidMoveError):
             return False
     
     def is_game_over(self) -> bool:
@@ -122,12 +122,137 @@ class ChessBoard:
         return str(self.board)
 
 
+# ─── Piece-Square Tables (from White's perspective, rank 1 = index 0) ──────
+# Values in centipawns. For Black, we mirror vertically.
+
+PAWN_PST = [
+      0,   0,   0,   0,   0,   0,   0,   0,
+     50,  50,  50,  50,  50,  50,  50,  50,
+     10,  10,  20,  30,  30,  20,  10,  10,
+      5,   5,  10,  25,  25,  10,   5,   5,
+      0,   0,   0,  20,  20,   0,   0,   0,
+      5,  -5, -10,   0,   0, -10,  -5,   5,
+      5,  10,  10, -20, -20,  10,  10,   5,
+      0,   0,   0,   0,   0,   0,   0,   0,
+]
+
+KNIGHT_PST = [
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20,   0,   0,   0,   0, -20, -40,
+    -30,   0,  10,  15,  15,  10,   0, -30,
+    -30,   5,  15,  20,  20,  15,   5, -30,
+    -30,   0,  15,  20,  20,  15,   0, -30,
+    -30,   5,  10,  15,  15,  10,   5, -30,
+    -40, -20,   0,   5,   5,   0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50,
+]
+
+BISHOP_PST = [
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10,   0,   0,   0,   0,   0,   0, -10,
+    -10,   0,  10,  10,  10,  10,   0, -10,
+    -10,   5,   5,  10,  10,   5,   5, -10,
+    -10,   0,   5,  10,  10,   5,   0, -10,
+    -10,  10,  10,  10,  10,  10,  10, -10,
+    -10,   5,   0,   0,   0,   0,   5, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20,
+]
+
+ROOK_PST = [
+      0,   0,   0,   0,   0,   0,   0,   0,
+      5,  10,  10,  10,  10,  10,  10,   5,
+     -5,   0,   0,   0,   0,   0,   0,  -5,
+     -5,   0,   0,   0,   0,   0,   0,  -5,
+     -5,   0,   0,   0,   0,   0,   0,  -5,
+     -5,   0,   0,   0,   0,   0,   0,  -5,
+     -5,   0,   0,   0,   0,   0,   0,  -5,
+      0,   0,   0,   5,   5,   0,   0,   0,
+]
+
+QUEEN_PST = [
+    -20, -10, -10,  -5,  -5, -10, -10, -20,
+    -10,   0,   0,   0,   0,   0,   0, -10,
+    -10,   0,   5,   5,   5,   5,   0, -10,
+     -5,   0,   5,   5,   5,   5,   0,  -5,
+      0,   0,   5,   5,   5,   5,   0,  -5,
+    -10,   5,   5,   5,   5,   5,   0, -10,
+    -10,   0,   5,   0,   0,   0,   0, -10,
+    -20, -10, -10,  -5,  -5, -10, -10, -20,
+]
+
+KING_MIDDLEGAME_PST = [
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+     20,  20,   0,   0,   0,   0,  20,  20,
+     20,  30,  10,   0,   0,  10,  30,  20,
+]
+
+KING_ENDGAME_PST = [
+    -50, -40, -30, -20, -20, -30, -40, -50,
+    -30, -20, -10,   0,   0, -10, -20, -30,
+    -30, -10,  20,  30,  30,  20, -10, -30,
+    -30, -10,  30,  40,  40,  30, -10, -30,
+    -30, -10,  30,  40,  40,  30, -10, -30,
+    -30, -10,  20,  30,  30,  20, -10, -30,
+    -30, -30,   0,   0,   0,   0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50,
+]
+
+PST_TABLES = {
+    chess.PAWN: PAWN_PST,
+    chess.KNIGHT: KNIGHT_PST,
+    chess.BISHOP: BISHOP_PST,
+    chess.ROOK: ROOK_PST,
+    chess.QUEEN: QUEEN_PST,
+}
+
+# Material values in centipawns
+PIECE_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 330,
+    chess.ROOK: 500,
+    chess.QUEEN: 900,
+    chess.KING: 0,
+}
+
+# Phase weights for tapered eval (total = 24 at start)
+PHASE_WEIGHTS = {
+    chess.PAWN: 0,
+    chess.KNIGHT: 1,
+    chess.BISHOP: 1,
+    chess.ROOK: 2,
+    chess.QUEEN: 4,
+    chess.KING: 0,
+}
+
+
+def _pst_score(piece_type: int, square: int, is_white: bool, endgame_weight: float) -> float:
+    """Get PST bonus for a piece (centipawns). square is 0-63, a1=0."""
+    if is_white:
+        idx = (7 - chess.square_rank(square)) * 8 + chess.square_file(square)
+    else:
+        idx = chess.square_rank(square) * 8 + chess.square_file(square)
+
+    if piece_type == chess.KING:
+        mg = KING_MIDDLEGAME_PST[idx]
+        eg = KING_ENDGAME_PST[idx]
+        return mg * (1.0 - endgame_weight) + eg * endgame_weight
+    elif piece_type in PST_TABLES:
+        return float(PST_TABLES[piece_type][idx])
+    return 0.0
+
+
 def evaluate_position_simple(board: ChessBoard) -> float:
     """Simple evaluation function based on piece values.
-    
+
     Args:
         board: ChessBoard instance
-        
+
     Returns:
         Evaluation score from white's perspective (positive = white better)
     """
@@ -137,9 +262,9 @@ def evaluate_position_simple(board: ChessBoard) -> float:
         chess.BISHOP: 3,
         chess.ROOK: 5,
         chess.QUEEN: 9,
-        chess.KING: 0  # King value not used in material count
+        chess.KING: 0
     }
-    
+
     score = 0.0
     for square in chess.SQUARES:
         piece = board.board.piece_at(square)
@@ -149,88 +274,211 @@ def evaluate_position_simple(board: ChessBoard) -> float:
                 score += value
             else:
                 score -= value
-    
-    # Add bonus for checkmate
+
     if board.is_checkmate():
         if board.get_turn() == chess.WHITE:
-            score = -1000  # Black wins
+            score = -1000
         else:
-            score = 1000  # White wins
-    
+            score = 1000
+
     return score
 
 
 def evaluate_position_advanced(board: ChessBoard) -> float:
-    """Advanced evaluation with simple positional terms.
+    """Strong classical evaluation with PST, pawn structure, king safety, etc.
 
-    Still returns score from white's perspective.
+    Returns score from white's perspective in centipawns (1 pawn = 100).
     """
-    score = evaluate_position_simple(board)
+    bb = board.board
 
-    # --- Center control (bonus for occupying central squares) ---
-    central_squares = [chess.D4, chess.E4, chess.D5, chess.E5]
-    for sq in central_squares:
-        piece = board.board.piece_at(sq)
-        if not piece:
-            continue
-        bonus = 0.2
-        if piece.color == chess.WHITE:
-            score += bonus
-        else:
-            score -= bonus
+    # ── Checkmate / Stalemate ──
+    if bb.is_checkmate():
+        return -30000.0 if bb.turn == chess.WHITE else 30000.0
+    if bb.is_stalemate() or bb.is_insufficient_material():
+        return 0.0
 
-    # --- Mobility: number of legal moves for each side ---
-    original_turn = board.board.turn
-
-    board.board.turn = chess.WHITE
-    white_mobility = board.board.legal_moves.count()
-
-    board.board.turn = chess.BLACK
-    black_mobility = board.board.legal_moves.count()
-
-    board.board.turn = original_turn
-
-    mobility_factor = 0.05
-    score += mobility_factor * (white_mobility - black_mobility)
-
-    # --- King safety (very simple heuristic) ---
-    piece_values = {
-        chess.PAWN: 1,
-        chess.KNIGHT: 3,
-        chess.BISHOP: 3,
-        chess.ROOK: 5,
-        chess.QUEEN: 9,
-    }
-    total_material = 0.0
+    # ── Game-phase for tapered eval ──
+    phase = 0
     for sq in chess.SQUARES:
-        p = board.board.piece_at(sq)
-        if p and p.piece_type in piece_values:
-            total_material += piece_values[p.piece_type]
+        p = bb.piece_at(sq)
+        if p and p.piece_type in PHASE_WEIGHTS:
+            phase += PHASE_WEIGHTS[p.piece_type]
+    phase = min(phase, 24)
+    endgame_weight = 1.0 - (phase / 24.0)  # 0 = full middlegame, 1 = pure endgame
 
-    # Only care about king safety when there is enough material on board
-    if total_material >= 14:
-        white_king_sq = board.board.king(chess.WHITE)
-        black_king_sq = board.board.king(chess.BLACK)
+    score = 0.0
 
-        def king_safety_penalty(king_sq: Optional[int], is_white: bool) -> float:
+    # ── Material + PST ──
+    white_bishops = 0
+    black_bishops = 0
+    white_pawns_by_file = [0] * 8
+    black_pawns_by_file = [0] * 8
+    white_pawn_squares: List[int] = []
+    black_pawn_squares: List[int] = []
+
+    for sq in chess.SQUARES:
+        p = bb.piece_at(sq)
+        if not p:
+            continue
+        mat = PIECE_VALUES.get(p.piece_type, 0)
+        pst = _pst_score(p.piece_type, sq, p.color == chess.WHITE, endgame_weight)
+
+        if p.color == chess.WHITE:
+            score += mat + pst
+            if p.piece_type == chess.BISHOP:
+                white_bishops += 1
+            if p.piece_type == chess.PAWN:
+                white_pawns_by_file[chess.square_file(sq)] += 1
+                white_pawn_squares.append(sq)
+        else:
+            score -= mat + pst
+            if p.piece_type == chess.BISHOP:
+                black_bishops += 1
+            if p.piece_type == chess.PAWN:
+                black_pawns_by_file[chess.square_file(sq)] += 1
+                black_pawn_squares.append(sq)
+
+    # ── Bishop pair bonus ──
+    if white_bishops >= 2:
+        score += 50
+    if black_bishops >= 2:
+        score -= 50
+
+    # ── Doubled pawns penalty ──
+    for f in range(8):
+        if white_pawns_by_file[f] > 1:
+            score -= 20 * (white_pawns_by_file[f] - 1)
+        if black_pawns_by_file[f] > 1:
+            score += 20 * (black_pawns_by_file[f] - 1)
+
+    # ── Isolated pawns penalty ──
+    for f in range(8):
+        has_left = (f > 0 and white_pawns_by_file[f - 1] > 0)
+        has_right = (f < 7 and white_pawns_by_file[f + 1] > 0)
+        if white_pawns_by_file[f] > 0 and not has_left and not has_right:
+            score -= 15 * white_pawns_by_file[f]
+
+        has_left_b = (f > 0 and black_pawns_by_file[f - 1] > 0)
+        has_right_b = (f < 7 and black_pawns_by_file[f + 1] > 0)
+        if black_pawns_by_file[f] > 0 and not has_left_b and not has_right_b:
+            score += 15 * black_pawns_by_file[f]
+
+    # ── Passed pawns bonus ──
+    for sq in white_pawn_squares:
+        f = chess.square_file(sq)
+        r = chess.square_rank(sq)
+        is_passed = True
+        for br in range(r + 1, 8):
+            for df in (f - 1, f, f + 1):
+                if 0 <= df <= 7:
+                    bsq = chess.square(df, br)
+                    bp = bb.piece_at(bsq)
+                    if bp and bp.piece_type == chess.PAWN and bp.color == chess.BLACK:
+                        is_passed = False
+                        break
+            if not is_passed:
+                break
+        if is_passed:
+            score += 20 + 10 * r  # More advanced = bigger bonus
+
+    for sq in black_pawn_squares:
+        f = chess.square_file(sq)
+        r = chess.square_rank(sq)
+        is_passed = True
+        for br in range(r - 1, -1, -1):
+            for df in (f - 1, f, f + 1):
+                if 0 <= df <= 7:
+                    bsq = chess.square(df, br)
+                    wp = bb.piece_at(bsq)
+                    if wp and wp.piece_type == chess.PAWN and wp.color == chess.WHITE:
+                        is_passed = False
+                        break
+            if not is_passed:
+                break
+        if is_passed:
+            score -= 20 + 10 * (7 - r)
+
+    # ── Rook on open / semi-open files ──
+    for sq in chess.SQUARES:
+        p = bb.piece_at(sq)
+        if not p or p.piece_type != chess.ROOK:
+            continue
+        f = chess.square_file(sq)
+        w_pawns_on_file = white_pawns_by_file[f]
+        b_pawns_on_file = black_pawns_by_file[f]
+        if p.color == chess.WHITE:
+            if w_pawns_on_file == 0 and b_pawns_on_file == 0:
+                score += 25  # open file
+            elif w_pawns_on_file == 0:
+                score += 15  # semi-open
+        else:
+            if w_pawns_on_file == 0 and b_pawns_on_file == 0:
+                score -= 25
+            elif b_pawns_on_file == 0:
+                score -= 15
+
+    # ── Mobility ──
+    original_turn = bb.turn
+    try:
+        bb.turn = chess.WHITE
+        white_mobility = bb.legal_moves.count()
+        bb.turn = chess.BLACK
+        black_mobility = bb.legal_moves.count()
+    finally:
+        bb.turn = original_turn
+
+    score += 4 * (white_mobility - black_mobility)
+
+    # ── King safety (middlegame only) ──
+    if endgame_weight < 0.6:
+        safety_factor = 1.0 - endgame_weight
+        wk = bb.king(chess.WHITE)
+        bk = bb.king(chess.BLACK)
+
+        def _pawn_shield(king_sq: int, color: bool) -> float:
+            """Count friendly pawns near king."""
             if king_sq is None:
                 return 0.0
-            file_index = chess.square_file(king_sq)  # 0..7 for a..h
-            rank_index = chess.square_rank(king_sq)  # 0..7 for 1..8
+            shield = 0.0
+            kf = chess.square_file(king_sq)
+            kr = chess.square_rank(king_sq)
+            pawn_rank_dir = 1 if color == chess.WHITE else -1
+            for df in (-1, 0, 1):
+                ff = kf + df
+                if ff < 0 or ff > 7:
+                    continue
+                for dr in (1, 2):
+                    rr = kr + pawn_rank_dir * dr
+                    if 0 <= rr <= 7:
+                        sq2 = chess.square(ff, rr)
+                        p2 = bb.piece_at(sq2)
+                        if p2 and p2.piece_type == chess.PAWN and p2.color == color:
+                            shield += 15.0 if dr == 1 else 8.0
+            return shield
 
-            penalty = 0.0
-            # Penalize king in the center files (d/e) in middlegame
-            if 2 <= file_index <= 5 and 2 <= rank_index <= 5:
-                penalty += 0.5
+        score += _pawn_shield(wk, chess.WHITE) * safety_factor
+        score -= _pawn_shield(bk, chess.BLACK) * safety_factor
 
-            # Small bonus if king appears "castled" on g- or c-file
-            if (is_white and rank_index == 0) or (not is_white and rank_index == 7):
-                if file_index in (1, 2, 5, 6):  # b,c or f,g files
-                    penalty -= 0.2
+        # Penalize open files near king
+        if wk is not None:
+            wkf = chess.square_file(wk)
+            for df in (-1, 0, 1):
+                ff = wkf + df
+                if 0 <= ff <= 7 and white_pawns_by_file[ff] == 0:
+                    score -= 15 * safety_factor
+        if bk is not None:
+            bkf = chess.square_file(bk)
+            for df in (-1, 0, 1):
+                ff = bkf + df
+                if 0 <= ff <= 7 and black_pawns_by_file[ff] == 0:
+                    score += 15 * safety_factor
 
-            return penalty
+    # ── Check bonus ──
+    if bb.is_check():
+        if bb.turn == chess.WHITE:
+            score -= 20  # Black is giving check (bad for white)
+        else:
+            score += 20
 
-        score -= king_safety_penalty(white_king_sq, True)
-        score += king_safety_penalty(black_king_sq, False)
-
-    return score
+    # Convert centipawns to pawns for compatibility
+    return score / 100.0

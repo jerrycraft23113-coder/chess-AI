@@ -124,21 +124,21 @@ def show_different_positions():
     print("EXAMPLES OF DIFFERENT POSITIONS")
     print("=" * 60)
     
-    positions = [
-        ("Starting Position", ChessBoard()),
-        ("After e2e4", None),
-        ("After e2e4 e7e5", None),
-    ]
-    
     # Create positions
+    board0 = ChessBoard()
+
     board1 = ChessBoard()
-    positions[1] = ("After e2e4", board1)
     board1.make_move_from_uci("e2e4")
-    
+
     board2 = ChessBoard()
     board2.make_move_from_uci("e2e4")
     board2.make_move_from_uci("e7e5")
-    positions[2] = ("After e2e4 e7e5", board2)
+
+    positions = [
+        ("Starting Position", board0),
+        ("After e2e4", board1),
+        ("After e2e4 e7e5", board2),
+    ]
     
     for name, board in positions:
         if board is None:
