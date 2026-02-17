@@ -62,7 +62,8 @@ class ChessGUI:
         """
         self.board = ChessBoard()
         self.ai = ChessAI(model_path=model_path, depth=ai_depth,
-                          classical_weight=classical_weight)
+                          classical_weight=classical_weight,
+                          time_limit=15.0)
         self.ai_color = ai_color
         self.ai_is_white = (ai_color == 'white')
         self.classical_weight = classical_weight
@@ -596,7 +597,7 @@ class ChessGUI:
         if is_ai_turn:
             info_msg = "Waiting for AI to move..."
         else:
-            info_msg = "Your turn - Click a piece to move"
+            info_msg = "Your turn - Click to move"
         
         if self.use_ctk:
             self.info_label.configure(text=info_msg)

@@ -20,11 +20,11 @@ from chess_model import ChessCNN, ChessPolicyNetwork
 
 
 class SelfPlayAgent:
-    """Agent for self-play that uses the neural network."""
-    
+    """Agent for self-play that uses the neural network. Vectorized batch evaluation."""
+
     def __init__(self, model: nn.Module, temperature: float = 1.0):
         """Initialize self-play agent.
-        
+
         Args:
             model: Neural network model (ChessCNN or ChessPolicyNetwork)
             temperature: Temperature for move selection (higher = more random)
@@ -32,83 +32,75 @@ class SelfPlayAgent:
         self.model = model
         self.model.eval()
         self.temperature = temperature
-    
+
     def select_move(self, board: ChessBoard, legal_moves: List[chess.Move]) -> chess.Move:
-        """Select a move using the policy network.
-        
+        """Select a move using vectorized batch evaluation.
+
         Args:
             board: Current board state
             legal_moves: List of legal moves
-            
+
         Returns:
             Selected move
         """
         if not legal_moves:
             return None
-        
+
         # Get board representation
         board_array = board.board_to_array()
         board_tensor = torch.FloatTensor(board_array).unsqueeze(0)
         board_tensor = board_tensor.permute(0, 3, 1, 2)  # (1, 12, 8, 8)
-        
+
         with torch.no_grad():
             if isinstance(self.model, ChessPolicyNetwork):
                 # Use policy network
                 policy_logits, _ = self.model(board_tensor)
                 policy_logits = policy_logits.squeeze(0)  # (4096,)
-                
-                # Convert moves to indices and get probabilities
+
+                # Vectorized: convert all move indices at once using numpy
+                move_indices = np.array(
+                    [m.from_square * 64 + m.to_square for m in legal_moves],
+                    dtype=np.int64
+                )
+                valid = move_indices < len(policy_logits)
                 move_probs = torch.zeros(len(legal_moves))
-                for i, move in enumerate(legal_moves):
-                    move_idx = self._move_to_index(move)
-                    if move_idx < len(policy_logits):
-                        move_probs[i] = policy_logits[move_idx]
-                
+                move_probs[valid] = policy_logits[move_indices[valid]]
+
                 # Apply temperature
                 move_probs = move_probs / self.temperature
                 move_probs = F.softmax(move_probs, dim=0)
-                
+
                 # Sample move
                 move_idx = torch.multinomial(move_probs, 1).item()
                 return legal_moves[move_idx]
             else:
-                # Use value network with minimax-like selection
-                # For simplicity, use greedy selection
-                best_move = None
-                best_value = float('-inf') if board.get_turn() else float('inf')
+                # Vectorized batch evaluation: evaluate ALL positions at once
+                n_moves = len(legal_moves)
+                batch_arrays = np.empty((n_moves, 8, 8, 12), dtype=np.float32)
 
-                for move in legal_moves:
-                    board_copy = board.copy()
-                    board_copy.make_move(move)
+                bb = board.board
+                for i, move in enumerate(legal_moves):
+                    bb.push(move)
+                    wrapper = ChessBoard.__new__(ChessBoard)
+                    wrapper.board = bb
+                    batch_arrays[i] = wrapper.board_to_array()
+                    bb.pop()
 
-                    board_array = board_copy.board_to_array()
-                    board_tensor = torch.FloatTensor(board_array).unsqueeze(0)
-                    board_tensor = board_tensor.permute(0, 3, 1, 2)
+                # Single batch forward pass (vectorized)
+                batch_tensor = torch.FloatTensor(batch_arrays).permute(0, 3, 1, 2)
+                values = self.model(batch_tensor).squeeze(1)  # (n_moves,)
 
-                    # Model outputs evaluation from white's perspective
-                    value = self.model(board_tensor).item()
+                # Select best move
+                if board.get_turn():  # White maximizing
+                    best_idx = values.argmax().item()
+                else:  # Black minimizing
+                    best_idx = values.argmin().item()
 
-                    # We want the best value from the CURRENT player's perspective
-                    # If current player is black, negate the white-perspective value
-                    if not board.get_turn():
-                        value = -value
+                return legal_moves[best_idx]
 
-                    if board.get_turn():  # White is maximizing
-                        if value > best_value:
-                            best_value = value
-                            best_move = move
-                    else:  # Black is minimizing (from white's perspective)
-                        if value < best_value:
-                            best_value = value
-                            best_move = move
-                
-                return best_move if best_move else random.choice(legal_moves)
-    
     def _move_to_index(self, move: chess.Move) -> int:
         """Convert move to index."""
-        from_square = move.from_square
-        to_square = move.to_square
-        return from_square * 64 + to_square
+        return move.from_square * 64 + move.to_square
 
 
 class GameTrajectory:
@@ -134,8 +126,8 @@ class GameTrajectory:
             self.policy_logits.append(policy_logits)
     
     def set_rewards(self, final_result: str, is_white_turns: List[bool]):
-        """Set rewards based on game result.
-        
+        """Set rewards based on game result. Vectorized with numpy.
+
         Args:
             final_result: '1-0' (white wins), '0-1' (black wins), '1/2-1/2' (draw)
             is_white_turns: List of booleans indicating if each position was white's turn
@@ -149,12 +141,11 @@ class GameTrajectory:
         else:  # draw
             white_reward = 0.0
             black_reward = 0.0
-        
-        # Assign rewards based on turn
-        self.rewards = []
-        for is_white_turn in is_white_turns:
-            reward = white_reward if is_white_turn else black_reward
-            self.rewards.append(reward)
+
+        # Vectorized reward assignment using numpy
+        turns = np.array(is_white_turns, dtype=bool)
+        rewards = np.where(turns, white_reward, black_reward)
+        self.rewards = rewards.tolist()
 
 
 def play_self_play_game(model: nn.Module, max_moves: int = 200) -> GameTrajectory:
@@ -263,21 +254,24 @@ def compute_policy_loss(model: nn.Module, trajectories: List[GameTrajectory],
     # Compute advantages (rewards - values, detach values for baseline)
     advantages = rewards_tensor - values.detach()
     
-    # Compute policy loss: REINFORCE
-    policy_loss = 0.0
-    valid_moves = 0
-    for i, move in enumerate(all_moves):
-        move_idx = move.from_square * 64 + move.to_square
-        if move_idx < policy_logits.shape[1]:
-            log_probs = F.log_softmax(policy_logits[i], dim=0)
-            move_log_prob = log_probs[move_idx]
-            advantage = advantages[i]
-            # REINFORCE: -log_prob * advantage
-            policy_loss -= move_log_prob * advantage
-            valid_moves += 1
-    
-    if valid_moves > 0:
-        policy_loss = policy_loss / valid_moves
+    # Vectorized policy loss: REINFORCE using batch indexing
+    move_indices = np.array(
+        [m.from_square * 64 + m.to_square for m in all_moves], dtype=np.int64
+    )
+    valid_mask = move_indices < policy_logits.shape[1]
+
+    if valid_mask.any():
+        valid_indices = torch.LongTensor(move_indices[valid_mask]).to(device)
+        valid_positions = torch.where(torch.BoolTensor(valid_mask).to(device))[0]
+
+        # Batch log_softmax over all valid positions
+        log_probs = F.log_softmax(policy_logits[valid_positions], dim=1)
+        # Gather the log probabilities for the selected moves
+        selected_log_probs = log_probs.gather(1, valid_indices.unsqueeze(1))
+        valid_advantages = advantages[valid_positions]
+
+        # REINFORCE: -log_prob * advantage, averaged
+        policy_loss = -(selected_log_probs * valid_advantages).mean()
     else:
         policy_loss = torch.tensor(0.0, device=device)
     
