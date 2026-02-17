@@ -8,10 +8,13 @@ import time
 import chess
 import numpy as np
 from typing import Optional, List, Tuple
-import random as _random
 import math
+import logging
+from pathlib import Path
 
 from chess_board import ChessBoard, evaluate_position_advanced, PIECE_VALUES
+
+logger = logging.getLogger(__name__)
 
 # Try torch for neural net, but make it optional
 try:
@@ -20,6 +23,18 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+# chess.polyglot: used for Zobrist hashing (always) and opening book (optional)
+import chess.polyglot
+
+_OPENING_BOOK = None
+try:
+    _BOOK_PATH = Path(__file__).parent / 'data' / 'opening_book.bin'
+    if _BOOK_PATH.exists():
+        _OPENING_BOOK = chess.polyglot.open_reader(str(_BOOK_PATH))
+        logger.info("Opening book loaded: %s", _BOOK_PATH)
+except Exception:
+    pass
 
 # ── Constants ──────────────────────────────────────────────────
 MATE_SCORE = 30000
@@ -32,60 +47,6 @@ _MVV_LVA = [[0]*7 for _ in range(7)]
 for _v in range(1, 7):
     for _a in range(1, 7):
         _MVV_LVA[_v][_a] = 10 * _PV[_v] - _PV[_a]
-
-# ── Zobrist hashing ───────────────────────────────────────────
-_rng = _random.Random(42)
-_ZOBRIST_PIECES = [[[_rng.getrandbits(64) for _ in range(64)] for _ in range(7)] for _ in range(2)]
-_ZOBRIST_TURN = _rng.getrandbits(64)
-_ZOBRIST_CASTLE = [_rng.getrandbits(64) for _ in range(4)]
-_ZOBRIST_EP = [_rng.getrandbits(64) for _ in range(8)]
-
-# Flatten to tuples for faster access
-_ZP_W = [None] + [tuple(_ZOBRIST_PIECES[1][pt]) for pt in range(1, 7)]
-_ZP_B = [None] + [tuple(_ZOBRIST_PIECES[0][pt]) for pt in range(1, 7)]
-_ZC = tuple(_ZOBRIST_CASTLE)
-_ZE = tuple(_ZOBRIST_EP)
-_ZT = _ZOBRIST_TURN
-
-_BB_H1 = chess.BB_H1
-_BB_A1 = chess.BB_A1
-_BB_H8 = chess.BB_H8
-_BB_A8 = chess.BB_A8
-
-
-def _zobrist_hash(bb: chess.Board) -> int:
-    """Compute Zobrist hash using bitboard iteration."""
-    h = 0
-    pta = bb.piece_type_at
-    zpw = _ZP_W
-    zpb = _ZP_B
-    # White pieces
-    tmp = int(bb.occupied_co[True])
-    while tmp:
-        sq = (tmp & -tmp).bit_length() - 1
-        tmp &= tmp - 1
-        h ^= zpw[pta(sq)][sq]
-    # Black pieces
-    tmp = int(bb.occupied_co[False])
-    while tmp:
-        sq = (tmp & -tmp).bit_length() - 1
-        tmp &= tmp - 1
-        h ^= zpb[pta(sq)][sq]
-    # Turn
-    if bb.turn:
-        h ^= _ZT
-    # Castling
-    cr = bb.castling_rights
-    if cr & _BB_H1: h ^= _ZC[0]
-    if cr & _BB_A1: h ^= _ZC[1]
-    if cr & _BB_H8: h ^= _ZC[2]
-    if cr & _BB_A8: h ^= _ZC[3]
-    # En passant
-    ep = bb.ep_square
-    if ep is not None:
-        h ^= _ZE[ep & 7]
-    return h
-
 
 # ── Futility/LMP margins ──────────────────────────────────────
 _FUTILITY_MARGIN = [0, 200, 350, 500]  # depth 0,1,2,3
@@ -115,9 +76,10 @@ class ChessAI:
         self.classical_weight = max(0.0, min(1.0, classical_weight))
         self.time_limit = time_limit
 
-        # Transposition table
+        # Transposition table (generation-based eviction)
         self.tt: dict = {}
-        self.tt_max_size = 4_000_000
+        self.tt_max_size = 8_000_000
+        self.tt_generation = 0
 
         # Killer moves
         self.killers = [[None, None] for _ in range(MAX_DEPTH)]
@@ -134,6 +96,7 @@ class ChessAI:
         self.start_time = 0.0
         self.time_up = False
         self.best_root = None
+        self.last_score = 0.0  # Last search score for eval bar
 
         # Neural net (optional)
         self.model = None
@@ -243,11 +206,11 @@ class ChessAI:
 
         # TT probe
         tt = self.tt
-        tt_key = _zobrist_hash(bb)
+        tt_key = chess.polyglot.zobrist_hash(bb)
         tt_move = None
         entry = tt.get(tt_key)
         if entry is not None:
-            e_depth, e_score, e_flag, e_move = entry
+            e_depth, e_score, e_flag, e_move, _gen = entry
             tt_move = e_move
             if e_depth >= depth and not is_pv:
                 if e_flag == 0:  # EXACT
@@ -305,7 +268,7 @@ class ChessAI:
                 return 0.0
             e2 = tt.get(tt_key)
             if e2 is not None:
-                tt_move = e2[3]
+                tt_move = e2[3]  # move is at index 3 in 5-tuple
 
         # ── Move ordering (inline for speed) ──
         killers = self.killers
@@ -436,8 +399,14 @@ class ChessAI:
         old = tt.get(tt_key)
         if old is None or old[0] <= depth:
             if len(tt) > self.tt_max_size:
-                tt.clear()
-            tt[tt_key] = (depth, best_score, flag, best_move)
+                # Generation-based eviction: remove old entries instead of clearing all
+                gen = self.tt_generation
+                to_del = [k for k, v in tt.items() if v[4] < gen - 2]
+                for k in to_del:
+                    del tt[k]
+                if len(tt) > self.tt_max_size:
+                    tt.clear()
+            tt[tt_key] = (depth, best_score, flag, best_move, self.tt_generation)
 
         return best_score
 
@@ -451,17 +420,31 @@ class ChessAI:
         if len(legal_moves) == 1:
             return legal_moves[0]
 
+        bb = board.board
+
+        # Opening book probe
+        if _OPENING_BOOK is not None:
+            try:
+                book_entry = _OPENING_BOOK.weighted_choice(bb)
+                book_move = book_entry.move
+                if book_move in bb.legal_moves:
+                    logger.info("Book move: %s", book_move.uci())
+                    self.last_score = 0.0
+                    return book_move
+            except (IndexError, Exception):
+                pass  # No book entry, continue with search
+
         self.nodes = 0
         self.time_up = False
         self.start_time = time.time()
         self.best_root = legal_moves[0]
         self.killers = [[None, None] for _ in range(MAX_DEPTH)]
+        self.tt_generation += 1
 
         # Age history
         self.hist_w >>= 1
         self.hist_b >>= 1
 
-        bb = board.board
         best_move = legal_moves[0]
         prev_score = 0.0
 
@@ -502,11 +485,9 @@ class ChessAI:
 
                 elapsed = time.time() - self.start_time
                 nps = self.nodes / elapsed if elapsed > 0 else 0
-                print(f"  depth {d:2d}: {best_move.uci()} "
-                      f"score={prev_score:+.2f} "
-                      f"nodes={self.nodes:,} "
-                      f"time={elapsed:.1f}s "
-                      f"nps={nps:,.0f}")
+                logger.info("  depth %2d: %s score=%+.2f nodes=%s time=%.1fs nps=%s",
+                            d, best_move.uci(), prev_score,
+                            f"{self.nodes:,}", elapsed, f"{nps:,.0f}")
 
                 if abs(prev_score) >= MATE_SCORE - 100:
                     break
@@ -514,16 +495,17 @@ class ChessAI:
                 if move_time > 0 and elapsed > move_time * 0.6:
                     break
 
+        self.last_score = prev_score
         return best_move
 
     def _search_root(self, bb, legal_moves, depth, alpha, beta):
         """Root search with negamax."""
         tt = self.tt
-        tt_key = _zobrist_hash(bb)
+        tt_key = chess.polyglot.zobrist_hash(bb)
         tt_move = None
         entry = tt.get(tt_key)
         if entry is not None:
-            tt_move = entry[3]
+            tt_move = entry[3]  # move is at index 3 in 5-tuple
 
         # Move ordering
         hist = self.hist_w if bb.turn else self.hist_b
@@ -588,26 +570,6 @@ class ChessAI:
                 break
 
         return best_score
-
-
-# ── Subprocess entry point (no Tk imports → safe for multiprocessing) ──
-
-def ai_search_process(fen, depth, classical_weight, time_limit, result_queue):
-    """Run AI search in a separate process so GUI timer stays smooth.
-    
-    This function is the target for multiprocessing.Process.
-    It has its own GIL and cannot block the GUI main thread.
-    """
-    try:
-        board = ChessBoard()
-        board.board = chess.Board(fen)
-        ai = ChessAI(depth=depth, classical_weight=classical_weight,
-                      time_limit=time_limit)
-        move = ai.get_best_move(board)
-        result_queue.put(move.uci() if move else None)
-    except Exception as e:
-        print(f"AI subprocess error: {e}")
-        result_queue.put(None)
 
 
 # ── CLI Interface ──────────────────────────────────────────────

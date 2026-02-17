@@ -22,16 +22,18 @@ from chess_model import ChessCNN, ChessPolicyNetwork
 class SelfPlayAgent:
     """Agent for self-play that uses the neural network. Vectorized batch evaluation."""
 
-    def __init__(self, model: nn.Module, temperature: float = 1.0):
+    def __init__(self, model: nn.Module, temperature: float = 1.0, epsilon: float = 0.1):
         """Initialize self-play agent.
 
         Args:
             model: Neural network model (ChessCNN or ChessPolicyNetwork)
             temperature: Temperature for move selection (higher = more random)
+            epsilon: Probability of choosing a random move (exploration)
         """
         self.model = model
         self.model.eval()
         self.temperature = temperature
+        self.epsilon = epsilon
 
     def select_move(self, board: ChessBoard, legal_moves: List[chess.Move]) -> chess.Move:
         """Select a move using vectorized batch evaluation.
@@ -74,6 +76,10 @@ class SelfPlayAgent:
                 move_idx = torch.multinomial(move_probs, 1).item()
                 return legal_moves[move_idx]
             else:
+                # Epsilon-greedy: random move with probability epsilon
+                if random.random() < self.epsilon:
+                    return random.choice(legal_moves)
+
                 # Vectorized batch evaluation: evaluate ALL positions at once
                 n_moves = len(legal_moves)
                 batch_arrays = np.empty((n_moves, 8, 8, 12), dtype=np.float32)
@@ -148,18 +154,20 @@ class GameTrajectory:
         self.rewards = rewards.tolist()
 
 
-def play_self_play_game(model: nn.Module, max_moves: int = 200) -> GameTrajectory:
+def play_self_play_game(model: nn.Module, max_moves: int = 200,
+                        temperature: float = 1.0) -> GameTrajectory:
     """Play a self-play game and return trajectory.
-    
+
     Args:
         model: Neural network model
         max_moves: Maximum moves before declaring draw
-        
+        temperature: Temperature for move selection
+
     Returns:
         GameTrajectory object
     """
     board = ChessBoard()
-    agent = SelfPlayAgent(model, temperature=1.0)
+    agent = SelfPlayAgent(model, temperature=temperature)
     trajectory = GameTrajectory()
     
     move_count = 0
@@ -313,24 +321,54 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
     print(f"Total games: {'infinite' if num_games <= 0 else num_games}")
     print(f"Batch size: {batch_size}")
     print("=" * 50)
-    
+
     trajectory_buffer = deque(maxlen=batch_size)
-    
+
+    # Win rate tracking
+    wins_white = 0
+    wins_black = 0
+    draws = 0
+
+    # Temperature annealing: start at 1.0, decay to 0.3
+    temp_start = 1.0
+    temp_end = 0.3
+    total_for_anneal = max(num_games, 100)
+
     try:
         # If num_games <= 0, run self-play games indefinitely until manually stopped
         game_num = 0
         while True:
             if num_games > 0 and game_num >= num_games:
                 break
-            
+
             game_num += 1
+
+            # Temperature annealing
+            frac = min(game_num / total_for_anneal, 1.0)
+            current_temp = temp_start + (temp_end - temp_start) * frac
+
             # Play self-play game
             if game_num % 10 == 0:
                 total_games = num_games if num_games > 0 else float("inf")
-                print(f"\nGame {game_num}/{total_games}...")
-            
-            trajectory = play_self_play_game(model)
+                total_played = wins_white + wins_black + draws
+                wr = (wins_white / total_played * 100) if total_played > 0 else 0
+                br = (wins_black / total_played * 100) if total_played > 0 else 0
+                dr = (draws / total_played * 100) if total_played > 0 else 0
+                print(f"\nGame {game_num}/{total_games} (temp={current_temp:.2f}) "
+                      f"W:{wr:.0f}% B:{br:.0f}% D:{dr:.0f}%")
+
+            trajectory = play_self_play_game(model, temperature=current_temp)
             trajectory_buffer.append(trajectory)
+
+            # Track win rates
+            if len(trajectory.rewards) > 0:
+                final_reward = trajectory.rewards[-1] if trajectory.is_white_turns[-1] else -trajectory.rewards[-1]
+                if final_reward > 0.5:
+                    wins_white += 1
+                elif final_reward < -0.5:
+                    wins_black += 1
+                else:
+                    draws += 1
             
             # Update model when buffer is full
             if len(trajectory_buffer) >= batch_size:

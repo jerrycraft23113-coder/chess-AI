@@ -92,8 +92,8 @@ def print_board_channels(board_array: np.ndarray):
         print(f"\n   Channel {channel:2d} ({piece_names[channel]}):")
         channel_data = board_array[:, :, channel]
         
-        # Print board with pieces
-        print("   " + "   ".join(["a", "b", "c", "d", "e", "f", "g", "h"]))
+        # Print board with pieces (column headers aligned with data)
+        print("     " + " ".join(["a", "b", "c", "d", "e", "f", "g", "h"]))
         for rank in range(7, -1, -1):  # From rank 8 to rank 1
             row_str = f"   {rank + 1} "
             for file in range(8):

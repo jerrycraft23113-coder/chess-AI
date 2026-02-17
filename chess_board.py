@@ -316,6 +316,9 @@ for _f in range(8):
         _mask |= _FILE_MASKS[_f + 1]
     _ADJ_FILE_MASKS[_f] = _mask
 
+# ─── Center control mask (d4, e4, d5, e5) ──────────────────────────────────
+_CENTER_MASK = (1 << chess.D4) | (1 << chess.E4) | (1 << chess.D5) | (1 << chess.E5)
+
 # ─── Precomputed passed pawn masks ──────────────────────────────────────────
 # For each square, the mask of squares where enemy pawns would block a passed pawn
 
@@ -441,6 +444,8 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
     score = 0.0
     w_bishops = 0
     b_bishops = 0
+    w_minors = 0
+    b_minors = 0
     wk_sq = 0
     bk_sq = 0
     w_pawns_by_file_0 = 0; w_pawns_by_file_1 = 0; w_pawns_by_file_2 = 0; w_pawns_by_file_3 = 0
@@ -483,8 +488,11 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
             elif f == 5: w_pawns_by_file_5 += 1
             elif f == 6: w_pawns_by_file_6 += 1
             else: w_pawns_by_file_7 += 1
+        elif pt == 2:  # KNIGHT
+            w_minors += 1
         elif pt == 3:  # BISHOP
             w_bishops += 1
+            w_minors += 1
         elif pt == 4:  # ROOK
             w_rook_files.append(sq & 7)
 
@@ -512,8 +520,11 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
             elif f == 5: b_pawns_by_file_5 += 1
             elif f == 6: b_pawns_by_file_6 += 1
             else: b_pawns_by_file_7 += 1
+        elif pt == 2:  # KNIGHT
+            b_minors += 1
         elif pt == 3:  # BISHOP
             b_bishops += 1
+            b_minors += 1
         elif pt == 4:  # ROOK
             b_rook_files.append(sq & 7)
 
@@ -611,10 +622,18 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
         if b_pf[f] == 0:
             score -= 25.0 if w_pf[f] == 0 else 15.0
 
-    # ── King safety (simplified - pawn shield only, no piece_at calls) ──
+    # ── Center control ──
+    w_center = bin(w_occ & _CENTER_MASK).count('1')
+    b_center = bin(b_occ & _CENTER_MASK).count('1')
+    score += (w_center - b_center) * 15.0
+
+    # ── Mobility approximation (minor piece development proxy) ──
+    score += (w_minors - b_minors) * 5.0
+
+    # ── King safety (pawn shield + semi-open file penalty) ──
     if eg_w < 0.6:
         sf = 1.0 - eg_w
-        # White king pawn shield: check if pawns are on shield squares via bitboard
+        # White king pawn shield + open file penalties
         kf = wk_sq & 7
         for df in range(-1, 2):
             ff = kf + df
@@ -622,7 +641,13 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
                 continue
             if w_pf[ff] == 0:
                 score -= 15.0 * sf
-        # Black king pawn shield
+                # Fully open file (no enemy pawn either) - extra penalty
+                if b_pf[ff] == 0:
+                    score -= 5.0 * sf
+                else:
+                    # Semi-open (own pawn missing, enemy pawn present) - extra penalty
+                    score -= 10.0 * sf
+        # Black king pawn shield + open file penalties
         kf = bk_sq & 7
         for df in range(-1, 2):
             ff = kf + df
@@ -630,6 +655,13 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
                 continue
             if b_pf[ff] == 0:
                 score += 15.0 * sf
+                if w_pf[ff] == 0:
+                    score += 5.0 * sf
+                else:
+                    score += 10.0 * sf
+
+    # ── Tempo bonus (small bonus for side to move) ──
+    score += 10.0 if bb.turn else -10.0
 
     # Convert centipawns to pawns
     return score * 0.01

@@ -20,24 +20,25 @@ import chess
 
 class ChessDataset(Dataset):
     """Dataset for chess positions and evaluations."""
-    
-    def __init__(self, positions: List[np.ndarray], evaluations: List[float]):
+
+    def __init__(self, positions: np.ndarray, evaluations: np.ndarray):
         """Initialize dataset.
-        
+
         Args:
-            positions: List of board arrays (8x8x12)
-            evaluations: List of evaluation scores
+            positions: numpy array of shape (N, 8, 8, 12) or (N, 12, 8, 8)
+            evaluations: numpy array of shape (N,)
         """
-        self.positions = torch.FloatTensor(np.array(positions))
+        if positions.ndim == 4 and positions.shape[-1] == 12:
+            # Convert (N, 8, 8, 12) → (N, 12, 8, 8) once upfront
+            positions = positions.transpose(0, 3, 1, 2)
+        self.positions = torch.FloatTensor(positions)
         self.evaluations = torch.FloatTensor(evaluations)
-    
+
     def __len__(self):
         return len(self.positions)
-    
+
     def __getitem__(self, idx):
-        # Convert from (8, 8, 12) to (12, 8, 8) for CNN
-        position = self.positions[idx].permute(2, 0, 1)
-        return position, self.evaluations[idx]
+        return self.positions[idx], self.evaluations[idx]
 
 
 def train_model(
@@ -95,48 +96,45 @@ def train_model(
         print(f"Epoch {epoch}/{total_epochs}, Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
 
 
-def load_training_data_from_file(data_path: str) -> Tuple[List[np.ndarray], List[float]]:
-    """Load training data from numpy file (memory-efficient version).
-    
+def load_training_data_from_file(data_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load training data from numpy file (direct numpy arrays, no per-element loop).
+
     Args:
         data_path: Path to .npz file containing training data
-        
+
     Returns:
-        Tuple of (positions, evaluations)
+        Tuple of (positions, evaluations) as numpy arrays
     """
     print(f"Loading training data from {data_path}...")
-    
+
     try:
-        # Use memory mapping for large files to reduce RAM usage
         data = np.load(data_path, mmap_mode='r')
-        num_positions = len(data['positions'])
-        
-        print(f"Found {num_positions} positions in file")
-        print("Loading data into memory (this may take a moment for large files)...")
-        
-        # Load positions in chunks to avoid memory spikes
-        chunk_size = 10000
-        positions = []
-        evaluations = []
-        
-        for i in range(0, num_positions, chunk_size):
-            end_idx = min(i + chunk_size, num_positions)
-            chunk_positions = data['positions'][i:end_idx]
-            chunk_evaluations = data['evaluations'][i:end_idx]
-            
-            # Convert to list of arrays
-            for pos in chunk_positions:
-                positions.append(pos)
-            evaluations.extend(chunk_evaluations.tolist())
-            
-            if (i + chunk_size) % 50000 == 0 or end_idx == num_positions:
-                print(f"  Loaded {end_idx}/{num_positions} positions...")
-        
+        positions = np.array(data['positions'])  # (N, 8, 8, 12)
+        evaluations = np.array(data['evaluations'], dtype=np.float32)  # (N,)
         print(f"Loaded {len(positions)} positions from file")
         return positions, evaluations
     except Exception as e:
         print(f"Error loading data from {data_path}: {e}")
-        return [], []
+        return np.array([]), np.array([])
+
+
+def mirror_positions(positions: np.ndarray, evaluations: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Horizontally mirror positions for data augmentation.
+
+    Flips along the file axis (left-right) to double the dataset.
+
+    Args:
+        positions: numpy array of shape (N, 8, 8, 12)
+        evaluations: numpy array of shape (N,)
+
+    Returns:
+        Tuple of (augmented_positions, augmented_evaluations) with 2N samples
+    """
+    mirrored = np.flip(positions, axis=2).copy()  # flip along file axis
+    aug_positions = np.concatenate([positions, mirrored], axis=0)
+    aug_evaluations = np.concatenate([evaluations, evaluations], axis=0)
+    print(f"Data augmentation: {len(positions)} -> {len(aug_positions)} positions")
+    return aug_positions, aug_evaluations
 
 
 def run_training(
@@ -145,6 +143,7 @@ def run_training(
     batch_size: int = 32,
     lr: float = 0.001,
     use_cpu: bool = True,
+    augment: bool = False,
 ):
     """Run the full supervised training pipeline.
     
@@ -173,19 +172,23 @@ def run_training(
         return
     
     positions, evaluations = load_training_data_from_file(data_path)
-    
+
     if len(positions) == 0:
         print(f"\nError: Loaded 0 positions from {data_path}.")
         print("Please check that parse_pgn_data.py completed successfully and produced non-empty data.")
         return
-    
+
+    # Data augmentation (horizontal mirror)
+    if augment:
+        positions, evaluations = mirror_positions(positions, evaluations)
+
     # Split into train and validation
     split_idx = int(len(positions) * 0.8)
     train_positions = positions[:split_idx]
     train_evaluations = evaluations[:split_idx]
     val_positions = positions[split_idx:]
     val_evaluations = evaluations[split_idx:]
-    
+
     # Create datasets
     train_dataset = ChessDataset(train_positions, train_evaluations)
     val_dataset = ChessDataset(val_positions, val_evaluations)
@@ -255,15 +258,18 @@ def main():
                        help='Learning rate (default: 0.001)')
     parser.add_argument('--use-cpu', action='store_true',
                        help='Force CPU usage (default: auto-detect GPU)')
-    
+    parser.add_argument('--augment', action='store_true',
+                       help='Enable data augmentation (horizontal mirror, doubles dataset)')
+
     args = parser.parse_args()
-    
+
     run_training(
         data_path=args.data,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         use_cpu=args.use_cpu,
+        augment=args.augment,
     )
 
 
