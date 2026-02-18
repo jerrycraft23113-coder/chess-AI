@@ -313,13 +313,16 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
     """
     model = model.to(device)
 
-    # Compile model for faster execution (PyTorch 2.x)
+    # Try torch.compile for faster execution (PyTorch 2.x, needs C++ compiler)
     if hasattr(torch, 'compile'):
         try:
-            model = torch.compile(model)
+            compiled_model = torch.compile(model)
+            with torch.no_grad():
+                compiled_model(torch.zeros(1, 12, 8, 8, device=device))
+            model = compiled_model
             print("Model compiled with torch.compile()")
         except Exception:
-            pass
+            print("torch.compile() skipped (no C++ compiler), using eager mode")
 
     model.train()
 

@@ -268,13 +268,18 @@ def run_training(
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    # Compile model for faster execution (PyTorch 2.x)
+    # Try torch.compile for faster execution (PyTorch 2.x, needs C++ compiler)
+    _compiled = False
     if hasattr(torch, 'compile'):
         try:
-            model = torch.compile(model)
+            compiled_model = torch.compile(model)
+            with torch.no_grad():
+                compiled_model(torch.zeros(1, 12, 8, 8, device=device))
+            model = compiled_model
+            _compiled = True
             print("Model compiled with torch.compile()")
         except Exception:
-            pass
+            print("torch.compile() skipped (no C++ compiler), using eager mode")
 
     # Train model
     print("\nStarting training...")
