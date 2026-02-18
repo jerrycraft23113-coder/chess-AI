@@ -623,8 +623,8 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
             score -= 25.0 if w_pf[f] == 0 else 15.0
 
     # ── Center control ──
-    w_center = bin(w_occ & _CENTER_MASK).count('1')
-    b_center = bin(b_occ & _CENTER_MASK).count('1')
+    w_center = _popcount(w_occ & _CENTER_MASK)
+    b_center = _popcount(b_occ & _CENTER_MASK)
     score += (w_center - b_center) * 15.0
 
     # ── Mobility approximation (minor piece development proxy) ──

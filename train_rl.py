@@ -12,6 +12,7 @@ import random
 from typing import List, Tuple, Optional, Dict
 import os
 import argparse
+import time
 from collections import deque
 import chess
 
@@ -311,10 +312,19 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
         save_interval: Save model every N games
     """
     model = model.to(device)
+
+    # Compile model for faster execution (PyTorch 2.x)
+    if hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile()")
+        except Exception:
+            pass
+
     model.train()
-    
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+
     print("Starting RL Training with Self-Play")
     print("=" * 50)
     print(f"Device: {device}")
@@ -334,6 +344,7 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
     temp_end = 0.3
     total_for_anneal = max(num_games, 100)
 
+    t_start = time.time()
     try:
         # If num_games <= 0, run self-play games indefinitely until manually stopped
         game_num = 0
@@ -354,9 +365,13 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
                 wr = (wins_white / total_played * 100) if total_played > 0 else 0
                 br = (wins_black / total_played * 100) if total_played > 0 else 0
                 dr = (draws / total_played * 100) if total_played > 0 else 0
+                elapsed_total = time.time() - t_start
+                gps = game_num / elapsed_total if elapsed_total > 0 else 0
                 print(f"\nGame {game_num}/{total_games} (temp={current_temp:.2f}) "
-                      f"W:{wr:.0f}% B:{br:.0f}% D:{dr:.0f}%")
+                      f"W:{wr:.0f}% B:{br:.0f}% D:{dr:.0f}% "
+                      f"[{gps:.1f} games/s]")
 
+            t_game = time.time()
             trajectory = play_self_play_game(model, temperature=current_temp)
             trajectory_buffer.append(trajectory)
 
@@ -372,67 +387,72 @@ def train_rl(model: nn.Module, num_games: int = 100, batch_size: int = 10,
             
             # Update model when buffer is full
             if len(trajectory_buffer) >= batch_size:
-                print(f"  Training on batch of {len(trajectory_buffer)} games...")
-                
+                t_train = time.time()
+
                 loss = None
                 if isinstance(model, ChessPolicyNetwork):
                     # Policy gradient training
                     loss = compute_policy_loss(model, list(trajectory_buffer), device)
                 else:
-                    # Value-based training (simplified)
-                    # Collect positions and rewards
-                    all_positions = []
-                    all_rewards = []
-                    
+                    # Value-based training — efficient numpy stacking
+                    pos_arrays = []
+                    rew_arrays = []
                     for traj in trajectory_buffer:
                         if len(traj.positions) > 0 and len(traj.rewards) > 0:
-                            all_positions.extend(traj.positions)
-                            all_rewards.extend(traj.rewards)
-                    
-                    if len(all_positions) > 0:
-                        positions_tensor = torch.FloatTensor(np.array(all_positions)).to(device)
-                        positions_tensor = positions_tensor.permute(0, 3, 1, 2)
-                        rewards_tensor = torch.FloatTensor(all_rewards).to(device).unsqueeze(1)
+                            pos_arrays.append(np.array(traj.positions, dtype=np.float32))
+                            rew_arrays.append(np.array(traj.rewards, dtype=np.float32))
 
-                        # Debug: print reward stats
-                        reward_mean = rewards_tensor.mean().item()
-                        reward_std = rewards_tensor.std().item()
-                        print(f"    Positions: {len(all_positions)}, Rewards: mean={reward_mean:.4f}, std={reward_std:.4f}")
+                    if pos_arrays:
+                        all_pos = np.concatenate(pos_arrays, axis=0)     # (N,8,8,12)
+                        all_rew = np.concatenate(rew_arrays, axis=0)     # (N,)
+                        n_pos = len(all_pos)
 
-                        predictions = model(positions_tensor)
-                        loss = F.mse_loss(predictions, rewards_tensor)
+                        # Transpose once and convert to tensor
+                        positions_tensor = torch.from_numpy(
+                            all_pos.transpose(0, 3, 1, 2).copy()
+                        ).to(device)
+                        rewards_tensor = torch.from_numpy(all_rew).to(device).unsqueeze(1)
+
+                        reward_mean = all_rew.mean()
+                        reward_std = all_rew.std()
+                        print(f"  Training: {n_pos} positions, "
+                              f"rewards mean={reward_mean:.4f} std={reward_std:.4f}")
+
+                        # Mini-batch gradient accumulation for large batches
+                        mini_bs = 512
+                        optimizer.zero_grad(set_to_none=True)
+                        total_loss = 0.0
+                        n_mini = 0
+                        for i in range(0, n_pos, mini_bs):
+                            p_batch = positions_tensor[i:i+mini_bs]
+                            r_batch = rewards_tensor[i:i+mini_bs]
+                            pred = model(p_batch)
+                            mb_loss = F.mse_loss(pred, r_batch)
+                            mb_loss.backward()
+                            total_loss += mb_loss.item()
+                            n_mini += 1
+
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        loss_val = total_loss / n_mini
+                        print(f"  Loss: {loss_val:.6f}, train time: {time.time()-t_train:.1f}s")
                     else:
-                        print("    Warning: No valid positions in trajectories, skipping batch")
+                        print("  Warning: No valid positions, skipping batch")
                         trajectory_buffer.clear()
                         continue
-                
-                # Check if loss is valid
-                if loss is None:
-                    print("    Warning: Loss is None, skipping batch")
-                    trajectory_buffer.clear()
-                    continue
-                
-                # Check if loss is zero or very small
-                if loss.item() == 0.0 or torch.isnan(loss):
-                    print(f"    Warning: Loss is {loss.item()}, checking data...")
-                    # Debug: check if rewards are all zero
-                    if isinstance(model, ChessPolicyNetwork):
-                        # For policy network, check trajectories
+
+                # Policy network backward
+                if isinstance(model, ChessPolicyNetwork) and loss is not None:
+                    if torch.isnan(loss) or loss.item() == 0.0:
                         total_rewards = sum(sum(traj.rewards) for traj in trajectory_buffer)
-                        print(f"    Total rewards in batch: {total_rewards}")
-                    else:
-                        # For value network, we already printed reward stats above
-                        pass
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                print(f"    Loss: {loss.item():.6f}")
-                
-                # Clear buffer
+                        print(f"  Warning: Loss={loss.item()}, total rewards={total_rewards}")
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    print(f"  Loss: {loss.item():.6f}, train time: {time.time()-t_train:.1f}s")
+
                 trajectory_buffer.clear()
             
             # Save model periodically

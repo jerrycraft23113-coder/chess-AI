@@ -24,7 +24,7 @@ from pathlib import Path
 from PIL import Image, ImageTk
 
 from chess_board import ChessBoard
-from play_chess import ChessAI
+from play_chess import ChessAI, PLAY_STYLES, STYLE_NORMAL
 
 logger = logging.getLogger(__name__)
 
@@ -994,18 +994,32 @@ class ChessGUI:
                                 width=6, font=('Arial', 20))
         depth_spin.grid(row=2, column=1, sticky=tk.W, pady=8, padx=(16, 0))
 
+        tk.Label(main_frame, text="Play style:", font=('Arial', 20),
+                 bg='white', fg=self.TEXT_COLOR).grid(row=3, column=0, sticky=tk.W, pady=8)
+        style_labels = {
+            'normal': 'Normal',
+            'aggressive': 'Aggressive',
+            'defensive': 'Defensive',
+            'random': 'Random',
+        }
+        style_var = tk.StringVar(value=getattr(self.ai, 'play_style', STYLE_NORMAL))
+        style_menu = tk.OptionMenu(main_frame, style_var,
+                                   *[s for s in PLAY_STYLES])
+        style_menu.config(font=('Arial', 18), width=12)
+        style_menu.grid(row=3, column=1, sticky=tk.W, pady=8, padx=(16, 0))
+
         tk.Label(main_frame, text="Classical eval weight:", font=('Arial', 20),
-                 bg='white', fg=self.TEXT_COLOR).grid(row=3, column=0, sticky=tk.W, pady=(16, 8))
+                 bg='white', fg=self.TEXT_COLOR).grid(row=4, column=0, sticky=tk.W, pady=(16, 8))
         weight_var = tk.DoubleVar(value=self.classical_weight)
         weight_scale = tk.Scale(main_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
                                 variable=weight_var, resolution=0.01, length=300,
                                 font=('Arial', 16), bg='white', highlightthickness=0,
                                 troughcolor='#ddd', sliderrelief=tk.FLAT)
-        weight_scale.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(16, 8), padx=(16, 0))
+        weight_scale.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=(16, 8), padx=(16, 0))
 
         weight_label = tk.Label(main_frame, text=f"{self.classical_weight:.2f}",
                                 font=('Arial', 18), bg='white', fg=self.LABEL_COLOR)
-        weight_label.grid(row=4, column=1, sticky=tk.W, pady=(0, 10), padx=(16, 0))
+        weight_label.grid(row=5, column=1, sticky=tk.W, pady=(0, 10), padx=(16, 0))
 
         def on_weight_change(*_):
             weight_label.config(text=f"{weight_var.get():.2f}")
@@ -1013,7 +1027,7 @@ class ChessGUI:
         weight_var.trace_add("write", on_weight_change)
 
         button_frame = tk.Frame(main_frame, bg='white')
-        button_frame.grid(row=5, column=0, columnspan=2, pady=(24, 0))
+        button_frame.grid(row=6, column=0, columnspan=2, pady=(24, 0))
 
         def apply_settings():
             try:
@@ -1023,6 +1037,9 @@ class ChessGUI:
                 new_weight = max(0.0, min(1.0, float(weight_var.get())))
                 self.classical_weight = new_weight
                 self.ai.classical_weight = new_weight
+                new_style = style_var.get()
+                if new_style in PLAY_STYLES:
+                    self.ai.play_style = new_style
             except Exception:
                 pass
             settings_window.destroy()

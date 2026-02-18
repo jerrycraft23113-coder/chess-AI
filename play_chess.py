@@ -24,7 +24,8 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-# chess.polyglot: used for Zobrist hashing (always) and opening book (optional)
+# chess.polyglot: used for opening book (optional)
+# TT keying uses bb._transposition_key() (C-level, ~1µs vs polyglot's ~27µs)
 import chess.polyglot
 
 _OPENING_BOOK = None
@@ -67,14 +68,24 @@ def _eval_fast(bb: chess.Board) -> float:
     return evaluate_position_advanced(_EVAL_WRAPPER)
 
 
+# ── Play style definitions ────────────────────────────────────
+STYLE_NORMAL = 'normal'
+STYLE_AGGRESSIVE = 'aggressive'
+STYLE_DEFENSIVE = 'defensive'
+STYLE_RANDOM = 'random'
+PLAY_STYLES = [STYLE_NORMAL, STYLE_AGGRESSIVE, STYLE_DEFENSIVE, STYLE_RANDOM]
+
+
 class ChessAI:
     """Chess AI - Negamax with maximum pruning for depth 10 in 15s."""
 
     def __init__(self, model_path: Optional[str] = None, depth: int = 5,
-                 classical_weight: float = 0.7, time_limit: float = 0.0):
+                 classical_weight: float = 0.7, time_limit: float = 0.0,
+                 play_style: str = STYLE_NORMAL):
         self.depth = depth
         self.classical_weight = max(0.0, min(1.0, classical_weight))
         self.time_limit = time_limit
+        self.play_style = play_style
 
         # Transposition table (generation-based eviction)
         self.tt: dict = {}
@@ -206,7 +217,7 @@ class ChessAI:
 
         # TT probe
         tt = self.tt
-        tt_key = chess.polyglot.zobrist_hash(bb)
+        tt_key = bb._transposition_key()
         tt_move = None
         entry = tt.get(tt_key)
         if entry is not None:
@@ -499,9 +510,9 @@ class ChessAI:
         return best_move
 
     def _search_root(self, bb, legal_moves, depth, alpha, beta):
-        """Root search with negamax."""
+        """Root search with negamax. Collects all root move scores for style selection."""
         tt = self.tt
-        tt_key = chess.polyglot.zobrist_hash(bb)
+        tt_key = bb._transposition_key()
         tt_move = None
         entry = tt.get(tt_key)
         if entry is not None:
@@ -538,6 +549,7 @@ class ChessAI:
 
         best_score = -INFINITY
         move_count = 0
+        root_scores = []  # Collect (score, move) for style selection
 
         for _, _, move in scored:
             move_count += 1
@@ -559,6 +571,8 @@ class ChessAI:
             if self.time_up:
                 break
 
+            root_scores.append((score, move))
+
             if score > best_score:
                 best_score = score
                 self.best_root = move
@@ -569,7 +583,80 @@ class ChessAI:
             if alpha >= beta:
                 break
 
+        # Style-based move selection (only on final iteration)
+        if not self.time_up and root_scores and self.play_style != STYLE_NORMAL:
+            self.best_root = self._select_by_style(root_scores, bb)
+
         return best_score
+
+    def _select_by_style(self, root_scores, bb):
+        """Select a move based on play style from root search scores."""
+        import random
+        root_scores.sort(key=lambda x: x[0], reverse=True)
+        best_score = root_scores[0][0]
+
+        if self.play_style == STYLE_RANDOM:
+            # Pick randomly from top moves within 0.5 pawn of best
+            threshold = best_score - 0.5
+            candidates = [(s, m) for s, m in root_scores if s >= threshold]
+            if not candidates:
+                candidates = [root_scores[0]]
+            return random.choice(candidates)[1]
+
+        elif self.play_style == STYLE_AGGRESSIVE:
+            # Prefer captures, checks, and forward moves among top candidates
+            threshold = best_score - 0.3
+            candidates = [(s, m) for s, m in root_scores if s >= threshold]
+            if not candidates:
+                candidates = [root_scores[0]]
+
+            def aggro_bonus(sm):
+                s, m = sm
+                bonus = 0.0
+                if bb.is_capture(m):
+                    bonus += 0.2
+                # Forward push (towards enemy king)
+                from_rank = m.from_square >> 3
+                to_rank = m.to_square >> 3
+                if bb.turn:  # white moves up
+                    bonus += (to_rank - from_rank) * 0.02
+                else:  # black moves down
+                    bonus += (from_rank - to_rank) * 0.02
+                # Check bonus
+                bb.push(m)
+                if bb.is_check():
+                    bonus += 0.15
+                bb.pop()
+                return s + bonus
+
+            candidates.sort(key=aggro_bonus, reverse=True)
+            return candidates[0][1]
+
+        elif self.play_style == STYLE_DEFENSIVE:
+            # Prefer safe, quiet moves — penalize captures slightly, prefer king safety
+            threshold = best_score - 0.3
+            candidates = [(s, m) for s, m in root_scores if s >= threshold]
+            if not candidates:
+                candidates = [root_scores[0]]
+
+            def safe_bonus(sm):
+                s, m = sm
+                bonus = 0.0
+                # Penalty for leaving back rank
+                pt = bb.piece_type_at(m.from_square)
+                if pt == chess.KING:
+                    # Prefer castling
+                    if abs(m.from_square - m.to_square) == 2:
+                        bonus += 0.3
+                # Slight penalty for captures (prefer quiet moves)
+                if bb.is_capture(m):
+                    bonus -= 0.05
+                return s + bonus
+
+            candidates.sort(key=safe_bonus, reverse=True)
+            return candidates[0][1]
+
+        return root_scores[0][1]
 
 
 # ── CLI Interface ──────────────────────────────────────────────

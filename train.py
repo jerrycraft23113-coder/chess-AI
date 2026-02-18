@@ -12,6 +12,7 @@ import random
 from typing import List, Tuple, Optional
 import os
 import argparse
+import time
 
 from chess_board import ChessBoard, evaluate_position_simple
 from chess_model import ChessCNN
@@ -46,54 +47,106 @@ def train_model(
     train_loader: DataLoader,
     num_epochs: int = 10,
     learning_rate: float = 0.001,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    val_loader: Optional[DataLoader] = None,
 ):
     """Train the chess evaluation model.
-    
+
     Args:
         model: Neural network model
         train_loader: DataLoader for training data
         num_epochs: Number of training epochs
         learning_rate: Learning rate for optimizer
         device: Device to train on ('cpu' or 'cuda')
+        val_loader: Optional validation DataLoader for early stopping
     """
     model = model.to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-    
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+    # OneCycleLR: much faster convergence than StepLR
+    total_steps = num_epochs * len(train_loader) if num_epochs > 0 else 1000
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=learning_rate * 10,
+        total_steps=total_steps, pct_start=0.3,
+        anneal_strategy='cos',
+    )
+
+    # Mixed precision (AMP) — works on both CPU & CUDA
+    use_amp = (device != 'cpu')
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    # Early stopping
+    best_val_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+
     model.train()
-    
+
     # If num_epochs <= 0, train indefinitely until manually stopped
     epoch = 0
     while True:
         if num_epochs > 0 and epoch >= num_epochs:
             break
-        
+
         epoch += 1
         total_loss = 0.0
         num_batches = 0
-        
+        t0 = time.time()
+
         for batch_idx, (positions, evaluations) in enumerate(train_loader):
-            positions = positions.to(device)
-            evaluations = evaluations.to(device).unsqueeze(1)
-            
-            # Forward pass
-            optimizer.zero_grad()
-            predictions = model(positions)
-            loss = criterion(predictions, evaluations)
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            
+            positions = positions.to(device, non_blocking=True)
+            evaluations = evaluations.to(device, non_blocking=True).unsqueeze(1)
+
+            optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
+
+            # Forward pass with optional AMP
+            with torch.amp.autocast(device_type=device, enabled=use_amp):
+                predictions = model(positions)
+                loss = criterion(predictions, evaluations)
+
+            # Backward pass with scaler
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
             total_loss += loss.item()
             num_batches += 1
-        
+
+        elapsed = time.time() - t0
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
-        scheduler.step()
         total_epochs = num_epochs if num_epochs > 0 else float("inf")
-        print(f"Epoch {epoch}/{total_epochs}, Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        lr_now = optimizer.param_groups[0]['lr']
+        samples_per_sec = len(train_loader.dataset) / elapsed if elapsed > 0 else 0
+        print(f"Epoch {epoch}/{total_epochs}, Loss: {avg_loss:.4f}, "
+              f"LR: {lr_now:.6f}, {samples_per_sec:.0f} samples/s, {elapsed:.1f}s")
+
+        # Validation & early stopping
+        if val_loader is not None:
+            model.eval()
+            val_loss = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for vp, ve in val_loader:
+                    vp = vp.to(device, non_blocking=True)
+                    ve = ve.to(device, non_blocking=True).unsqueeze(1)
+                    val_loss += criterion(model(vp), ve).item()
+                    val_batches += 1
+            avg_val = val_loss / val_batches if val_batches > 0 else 0
+            print(f"  Val Loss: {avg_val:.4f}")
+            model.train()
+
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"  Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+                    break
 
 
 def load_training_data_from_file(data_path: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -140,7 +193,7 @@ def mirror_positions(positions: np.ndarray, evaluations: np.ndarray) -> Tuple[np
 def run_training(
     data_path: str = 'data/training_data.npz',
     epochs: int = 20,
-    batch_size: int = 32,
+    batch_size: int = 128,
     lr: float = 0.001,
     use_cpu: bool = True,
     augment: bool = False,
@@ -192,18 +245,37 @@ def run_training(
     # Create datasets
     train_dataset = ChessDataset(train_positions, train_evaluations)
     val_dataset = ChessDataset(val_positions, val_evaluations)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
+
+    # Optimized DataLoader: larger batch, multi-worker prefetch, pin_memory for CUDA
+    pin = (device != 'cpu')
+    num_workers = min(4, os.cpu_count() or 1) if len(train_dataset) > 1000 else 0
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin, persistent_workers=(num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size * 2, shuffle=False,
+        num_workers=num_workers, pin_memory=pin, persistent_workers=(num_workers > 0),
+    )
+
     print(f"\nTraining samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
-    
+    print(f"DataLoader workers: {num_workers}, batch_size: {batch_size}")
+
     # Create model
     print("\nInitializing model...")
     model = ChessCNN(hidden_size=256)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+
+    # Compile model for faster execution (PyTorch 2.x)
+    if hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile()")
+        except Exception:
+            pass
+
     # Train model
     print("\nStarting training...")
     try:
@@ -212,31 +284,30 @@ def run_training(
             train_loader=train_loader,
             num_epochs=epochs,
             learning_rate=lr,
-            device=device
+            device=device,
+            val_loader=val_loader,
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted by user (KeyboardInterrupt).")
-        print("Proceeding to validation and saving the current model weights...")
-    
-    # Validate
-    print("\nValidating model...")
+        print("Saving current model weights...")
+
+    # Final validation
+    print("\nFinal validation...")
     model.eval()
     total_val_loss = 0.0
     num_batches = 0
     criterion = nn.MSELoss()
-    
+
     with torch.no_grad():
         for positions, evaluations in val_loader:
-            positions = positions.to(device)
-            evaluations = evaluations.to(device).unsqueeze(1)
-            predictions = model(positions)
-            loss = criterion(predictions, evaluations)
-            total_val_loss += loss.item()
+            positions = positions.to(device, non_blocking=True)
+            evaluations = evaluations.to(device, non_blocking=True).unsqueeze(1)
+            total_val_loss += criterion(model(positions), evaluations).item()
             num_batches += 1
-    
+
     avg_val_loss = total_val_loss / num_batches if num_batches > 0 else 0
-    print(f"Validation Loss: {avg_val_loss:.4f}")
-    
+    print(f"Final Validation Loss: {avg_val_loss:.4f}")
+
     # Save model
     model_dir = "models"
     os.makedirs(model_dir, exist_ok=True)
@@ -252,8 +323,8 @@ def main():
                        help='Path to training data file (default: data/training_data.npz)')
     parser.add_argument('--epochs', type=int, default=20,
                        help='Number of training epochs (default: 20, use <= 0 for infinite)')
-    parser.add_argument('--batch-size', type=int, default=32,
-                       help='Batch size (default: 32)')
+    parser.add_argument('--batch-size', type=int, default=128,
+                       help='Batch size (default: 128)')
     parser.add_argument('--lr', type=float, default=0.001,
                        help='Learning rate (default: 0.001)')
     parser.add_argument('--use-cpu', action='store_true',
