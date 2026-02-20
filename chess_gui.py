@@ -17,6 +17,7 @@ from tkinter import ttk, messagebox
 import chess
 from typing import Optional, Tuple, Dict
 import threading
+import copy
 import logging
 import sys
 import time
@@ -111,6 +112,10 @@ class ChessGUI:
         self._ai_thread = None
         self._ai_result = [None]
 
+        # Pondering state
+        self._ponder_thread = None
+        self._ponder_move = None  # Predicted opponent move
+
         # Initialize image variables
         self.images_dir = Path(__file__).parent / 'images'
         self.piece_images: Dict[str, ImageTk.PhotoImage] = {}
@@ -148,6 +153,7 @@ class ChessGUI:
 
         # Create UI
         self.create_widgets()
+        self._setup_canvas()
         self.update_display()
 
         # Start AI move if AI plays white
@@ -465,6 +471,45 @@ class ChessGUI:
                 fill=self.LABEL_COLOR, anchor=tk.CENTER
             )
 
+    def _setup_canvas(self):
+        """Create persistent canvas items once. Called after create_widgets()."""
+        c = self.chess_canvas
+        sz = self.square_size
+
+        # Layer 1: Board background
+        if self.board_image:
+            c.create_image(0, 0, anchor=tk.NW, image=self.board_image, tags='bg')
+        else:
+            for row in range(8):
+                for col in range(8):
+                    x1, y1 = col * sz, row * sz
+                    bg = self.LIGHT_SQUARE if (row + col) % 2 == 0 else self.DARK_SQUARE
+                    c.create_rectangle(x1, y1, x1 + sz, y1 + sz, fill=bg, outline='', tags='bg')
+
+        # Layer 2: Highlight rectangles (initially hidden)
+        self._hl_ids = [[None] * 8 for _ in range(8)]
+        for row in range(8):
+            for col in range(8):
+                x1, y1 = col * sz, row * sz
+                rid = c.create_rectangle(x1, y1, x1 + sz, y1 + sz, fill='', outline='', state='hidden')
+                self._hl_ids[row][col] = rid
+
+        # Layer 3: Piece images (initially blank)
+        self._pc_ids = [[None] * 8 for _ in range(8)]
+        # Blank 1x1 transparent image as placeholder
+        self._blank_img = ImageTk.PhotoImage(Image.new('RGBA', (1, 1), (0, 0, 0, 0)))
+        self._image_refs.append(self._blank_img)
+        for row in range(8):
+            for col in range(8):
+                cx = col * sz + sz // 2
+                cy = row * sz + sz // 2
+                pid = c.create_image(cx, cy, image=self._blank_img, anchor=tk.CENTER)
+                self._pc_ids[row][col] = pid
+
+        # Cache previous state for dirty checking
+        self._prev_highlights = [[None] * 8 for _ in range(8)]
+        self._prev_pieces = [[None] * 8 for _ in range(8)]
+
     def _gui_square_to_chess(self, row: int, col: int) -> int:
         """Convert GUI (row, col) to chess square index, accounting for board flip."""
         if self.flip_board:
@@ -487,74 +532,67 @@ class ChessGUI:
         return self.LIGHT_SQUARE if is_light else self.DARK_SQUARE
 
     def update_display(self):
-        """Update the chess board display using images."""
-        self.chess_canvas.delete("all")
-        self.square_rects = {}
+        """Update the chess board display — incremental, only updates changed items."""
+        c = self.chess_canvas
+        hl_ids = self._hl_ids
+        pc_ids = self._pc_ids
+        prev_hl = self._prev_highlights
+        prev_pc = self._prev_pieces
+        board = self.board.board
+        is_check = board.is_check()
+        turn = board.turn
 
-        # Draw board background
-        if self.board_image:
-            self.chess_canvas.create_image(0, 0, anchor=tk.NW, image=self.board_image)
-        else:
-            for row in range(8):
-                for col in range(8):
-                    x1 = col * self.square_size
-                    y1 = row * self.square_size
-                    x2 = x1 + self.square_size
-                    y2 = y1 + self.square_size
-                    bg_color = self.get_square_color(row, col)
-                    self.chess_canvas.create_rectangle(x1, y1, x2, y2, fill=bg_color, outline='')
+        # Pre-compute legal move set for fast lookup
+        legal_set = set(self.legal_moves) if self.legal_moves else set()
 
-        # Draw pieces and highlights
         for row in range(8):
             for col in range(8):
                 chess_square = self._gui_square_to_chess(row, col)
-                piece = self.board.board.piece_at(chess_square)
+                piece = board.piece_at(chess_square)
 
-                x1 = col * self.square_size
-                y1 = row * self.square_size
-                x2 = x1 + self.square_size
-                y2 = y1 + self.square_size
-                center_x = x1 + self.square_size // 2
-                center_y = y1 + self.square_size // 2
-
-                # Highlight last move (from and to squares)
-                if self.last_move:
-                    if chess_square == self.last_move.from_square or chess_square == self.last_move.to_square:
-                        self.chess_canvas.create_rectangle(
-                            x1, y1, x2, y2, fill=self.LAST_MOVE_COLOR,
-                            outline='', tags='last_move'
-                        )
-
-                # Highlight selected square
+                # Determine highlight color for this square
+                hl_color = None
+                if self.last_move and (chess_square == self.last_move.from_square or chess_square == self.last_move.to_square):
+                    hl_color = self.LAST_MOVE_COLOR
                 if self.selected_square == (row, col):
-                    self.chess_canvas.create_rectangle(x1, y1, x2, y2, fill=self.SELECTED, outline='', tags='highlight')
+                    hl_color = self.SELECTED
+                elif (row, col) in legal_set:
+                    hl_color = self.HIGHLIGHT
+                elif is_check and piece and piece.piece_type == chess.KING and piece.color == turn:
+                    hl_color = self.CHECK_COLOR
 
-                # Highlight legal moves
-                elif (row, col) in self.legal_moves:
-                    self.chess_canvas.create_rectangle(x1, y1, x2, y2, fill=self.HIGHLIGHT, outline='', tags='highlight')
+                # Update highlight only if changed
+                if hl_color != prev_hl[row][col]:
+                    if hl_color:
+                        c.itemconfig(hl_ids[row][col], fill=hl_color, state='normal')
+                    else:
+                        c.itemconfig(hl_ids[row][col], state='hidden')
+                    prev_hl[row][col] = hl_color
 
-                # Highlight check
-                elif self.board.is_check() and piece and piece.piece_type == chess.KING and piece.color == self.board.get_turn():
-                    self.chess_canvas.create_rectangle(x1, y1, x2, y2, fill=self.CHECK_COLOR, outline='', tags='highlight')
+                # Determine piece symbol
+                pc_sym = piece.symbol() if piece else None
 
-                # Draw piece image
-                if piece:
-                    piece_symbol = piece.symbol()
-                    if piece_symbol in self.piece_images:
-                        piece_img = self.piece_images[piece_symbol]
-                        self.chess_canvas.create_image(center_x, center_y, image=piece_img, tags='piece', anchor=tk.CENTER)
-
-                # Invisible rectangle for click detection
-                rect_id = self.chess_canvas.create_rectangle(x1, y1, x2, y2, fill='', outline='', tags='square')
-                self.square_rects[(row, col)] = rect_id
+                # Update piece only if changed
+                if pc_sym != prev_pc[row][col]:
+                    if pc_sym and pc_sym in self.piece_images:
+                        c.itemconfig(pc_ids[row][col], image=self.piece_images[pc_sym])
+                    else:
+                        c.itemconfig(pc_ids[row][col], image=self._blank_img)
+                    prev_pc[row][col] = pc_sym
 
         self.update_status()
         self.update_move_history()
+        # Force immediate screen render (don't let ponder thread delay it)
+        self.root.update_idletasks()
 
     def on_canvas_click(self, event):
         """Handle canvas click event."""
         if self.is_ai_thinking or self.board.is_game_over() or self.game_timed_out:
             return
+
+        # Pause pondering to free CPU/GIL for responsive GUI
+        if self._ponder_thread and self._ponder_thread.is_alive():
+            self.ai.time_up = True
 
         col = int(event.x // self.square_size)
         row = int(event.y // self.square_size)
@@ -627,42 +665,54 @@ class ChessGUI:
             self.info_label.config(text=info_msg)
 
     def update_move_history(self):
-        """Update move history display with SAN notation."""
-        self.history_text.config(state=tk.NORMAL)
-        self.history_text.delete(1.0, tk.END)
+        """Update move history display — only append new moves, don't rebuild all."""
+        move_stack = self.board.board.move_stack
+        n = len(move_stack)
 
-        move_stack = list(self.board.board.move_stack)
-        if not move_stack:
-            self.history_text.config(state=tk.DISABLED)
+        # Skip if nothing changed
+        if n == getattr(self, '_hist_len', -1):
             return
 
-        # Replay moves on a temp board to get SAN notation
-        temp_board = chess.Board()
-        san_moves = []
-        for move in move_stack:
+        # If moves were undone, do a full rebuild
+        if n < getattr(self, '_hist_len', 0):
+            self._hist_len = 0
+            self._hist_san = []
+            self._hist_board = chess.Board()
+            self.history_text.config(state=tk.NORMAL)
+            self.history_text.delete(1.0, tk.END)
+
+        # Init on first call
+        if not hasattr(self, '_hist_san'):
+            self._hist_len = 0
+            self._hist_san = []
+            self._hist_board = chess.Board()
+
+        # Compute SAN for new moves only
+        self.history_text.config(state=tk.NORMAL)
+        for i in range(self._hist_len, n):
+            move = move_stack[i]
             try:
-                san = temp_board.san(move)
-                san_moves.append(san)
-                temp_board.push(move)
+                san = self._hist_board.san(move)
+                self._hist_san.append(san)
+                self._hist_board.push(move)
             except Exception:
-                san_moves.append(move.uci())
+                self._hist_san.append(move.uci())
                 try:
-                    temp_board.push(move)
+                    self._hist_board.push(move)
                 except Exception:
                     break
 
-        for i in range(0, len(san_moves), 2):
-            move_num = (i // 2) + 1
-            white_san = san_moves[i]
-            black_san = san_moves[i + 1] if i + 1 < len(san_moves) else ""
+            idx = len(self._hist_san) - 1
+            if idx % 2 == 0:
+                # White move — start new line
+                move_num = (idx // 2) + 1
+                num_str = f"{move_num}.".rjust(4)
+                self.history_text.insert(tk.END, f"{num_str} {san:<7s} ")
+            else:
+                # Black move — append to current line
+                self.history_text.insert(tk.END, f"{san}\n")
 
-            # Fixed-width columns: "3. e4      Nf6"
-            #   move_num: 3 chars right-aligned, white: 7 chars left-aligned
-            num_str = f"{move_num}.".rjust(4)
-            line = f"{num_str} {white_san:<7s} {black_san}\n"
-
-            self.history_text.insert(tk.END, line)
-
+        self._hist_len = n
         self.history_text.see(tk.END)
         self.history_text.config(state=tk.DISABLED)
 
@@ -773,9 +823,27 @@ class ChessGUI:
         if not is_ai_turn:
             return
 
+        # Stop pondering before starting actual search
+        self._stop_pondering(actual_move=self.last_move)
+
         self.is_ai_thinking = True
         self._ai_result = [None]
         self.update_status()
+
+        # Smart time management: allocate time based on remaining clock
+        remaining = self.white_time if self.board.get_turn() == chess.WHITE else self.black_time
+        move_number = len(self.board.board.move_stack) // 2 + 1
+        # More aggressive: assume ~35 moves per game, keep buffer
+        moves_left = max(12, 40 - move_number)
+        move_time = remaining / moves_left
+        # Cap: fast enough to not bore player, strong enough to play well
+        move_time = max(1.0, min(5.0, move_time))
+        # Endgame: search is faster, don't waste time
+        piece_count = bin(self.board.board.occupied).count('1')
+        if piece_count <= 10:
+            move_time = min(move_time, 3.0)
+        self.ai.time_limit = move_time
+        self.ai._tl = move_time
 
         def _run():
             try:
@@ -832,8 +900,75 @@ class ChessGUI:
                     messagebox.showinfo("Game Over", "Black wins!")
                 elif result == '1/2-1/2':
                     messagebox.showinfo("Game Over", "Draw!")
+            else:
+                # Game still going — delay ponder so canvas renders first
+                self.root.after(200, self._start_pondering)
         else:
             self.update_display()
+
+    # ── Pondering ─────────────────────────────────────────────
+
+    def _start_pondering(self):
+        """Start pondering: predict opponent's move and pre-search our response."""
+        if self.board.is_game_over() or self.game_timed_out:
+            return
+
+        bb = self.board.board
+        tt_key = bb._transposition_key()
+        entry = self.ai.tt.get(tt_key)
+        if not entry or not entry[3]:
+            return
+
+        ponder_move = entry[3]
+        # Validate it's legal in current position
+        if ponder_move not in bb.legal_moves:
+            return
+
+        self._ponder_move = ponder_move
+        logger.info("Pondering: predicting opponent plays %s", ponder_move.uci())
+
+        # Deep-copy board and apply predicted opponent move
+        ponder_board = copy.deepcopy(bb)
+        ponder_board.push(ponder_move)
+
+        # Wrapper matching ChessBoard interface for get_best_move
+        wrapper = type('_PonderBoard', (), {'board': ponder_board})()
+
+        def _ponder_run():
+            # Set generous time limit (will be interrupted when opponent moves)
+            old_tl = self.ai.time_limit
+            old_tl_cached = self.ai._tl
+            self.ai.time_limit = 300.0
+            self.ai._tl = 300.0
+            try:
+                self.ai.get_best_move(wrapper)
+            except Exception as e:
+                logger.debug("Ponder search ended: %s", e)
+            finally:
+                self.ai.time_limit = old_tl
+                self.ai._tl = old_tl_cached
+
+        self._ponder_thread = threading.Thread(target=_ponder_run, daemon=True)
+        self._ponder_thread.start()
+
+    def _stop_pondering(self, actual_move=None):
+        """Stop pondering and report hit/miss."""
+        if self._ponder_thread is None:
+            return
+
+        was_pondering = self._ponder_thread.is_alive()
+        if was_pondering:
+            self.ai.time_up = True
+            self._ponder_thread.join(timeout=1.0)
+
+        if was_pondering and actual_move and self._ponder_move:
+            if actual_move == self._ponder_move:
+                logger.info("Ponder HIT! (%s) — TT is warm", actual_move.uci())
+            else:
+                logger.info("Ponder miss (%s != %s)", actual_move.uci(), self._ponder_move.uci())
+
+        self._ponder_thread = None
+        self._ponder_move = None
 
     def update_eval_bar(self, score_pawns: float):
         """Draw eval bar. score_pawns is from white's perspective."""
@@ -867,6 +1002,8 @@ class ChessGUI:
     def new_game(self):
         """Start a new game."""
         if messagebox.askyesno("New Game", "Start a new game?"):
+            # Stop pondering first
+            self._stop_pondering()
             if self.is_ai_thinking:
                 # Signal AI to stop
                 self.ai.time_up = True
@@ -888,6 +1025,13 @@ class ChessGUI:
             self.is_ai_thinking = False
             # Clear AI transposition table for the new game
             self.ai.transposition_table.clear()
+            # Reset canvas dirty-check state
+            self._prev_highlights = [[None] * 8 for _ in range(8)]
+            self._prev_pieces = [[None] * 8 for _ in range(8)]
+            # Reset move history cache
+            self._hist_len = 0
+            self._hist_san = []
+            self._hist_board = chess.Board()
             # Reset cached timer state
             self._last_white_text = None
             self._last_black_text = None
@@ -904,6 +1048,7 @@ class ChessGUI:
 
     def undo_move(self):
         """Undo the last move."""
+        self._stop_pondering()
         if self.is_ai_thinking:
             messagebox.showinfo("Undo", "Please wait for AI to finish thinking.")
             return

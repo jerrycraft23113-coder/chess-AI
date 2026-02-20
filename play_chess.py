@@ -153,7 +153,9 @@ class ChessAI:
 
     def _quiesce(self, bb, alpha, beta, qdepth=0):
         self.nodes += 1
-        if (self.nodes & 65535) == 0:
+        if self.time_up:
+            return 0.0
+        if (self.nodes & 8191) == 0:
             if self._tl > 0 and _time() - self.start_time >= self._tl:
                 self.time_up = True
                 return 0.0
@@ -219,9 +221,11 @@ class ChessAI:
 
     def _negamax(self, bb, depth, alpha, beta, do_null=True, prev_move_key=0):
         self.nodes += 1
+        if self.time_up:
+            return 0.0
 
-        # Time check every 65536 nodes + yield GIL so GUI stays responsive
-        if (self.nodes & 65535) == 0:
+        # Time check + yield GIL every 8192 nodes
+        if (self.nodes & 8191) == 0:
             if self._tl > 0 and _time() - self.start_time >= self._tl:
                 self.time_up = True
                 return 0.0
