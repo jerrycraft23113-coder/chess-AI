@@ -98,8 +98,8 @@ class ChessGUI:
         # Board flip: flip when player plays black (AI is white)
         self.flip_board = (ai_color == 'white')
 
-        # Chess clock - 10 minutes per player
-        self.time_limit = 600.0
+        # Chess clock - 15 minutes per player
+        self.time_limit = 900.0
         self.white_time = self.time_limit
         self.black_time = self.time_limit
         self.timer_running = False
@@ -313,14 +313,14 @@ class ChessGUI:
             timer_frame.pack(pady=8, padx=18, fill=tk.X)
 
             self.white_timer_label = tk.Label(
-                timer_frame, text="\u2654 White   10:00",
+                timer_frame, text="\u2654 White   15:00",
                 font=('Consolas', 20, 'bold'),
                 bg='white', fg=self.TEXT_COLOR, anchor='w'
             )
             self.white_timer_label.pack(pady=(4, 2), padx=8, anchor=tk.W, fill=tk.X)
 
             self.black_timer_label = tk.Label(
-                timer_frame, text="\u265a Black   10:00",
+                timer_frame, text="\u265a Black   15:00",
                 font=('Consolas', 20),
                 bg='white', fg=self.LABEL_COLOR, anchor='w'
             )
@@ -394,14 +394,14 @@ class ChessGUI:
             timer_frame.pack(pady=8, padx=18, fill=tk.X)
 
             self.white_timer_label = tk.Label(
-                timer_frame, text="\u2654 White   10:00",
+                timer_frame, text="\u2654 White   15:00",
                 font=self._timer_font_bold,
                 bg='white', fg=self.TEXT_COLOR, anchor='w'
             )
             self.white_timer_label.pack(pady=4, anchor=tk.W, fill=tk.X)
 
             self.black_timer_label = tk.Label(
-                timer_frame, text="\u265a Black   10:00",
+                timer_frame, text="\u265a Black   15:00",
                 font=self._timer_font_normal,
                 bg='white', fg=self.LABEL_COLOR, anchor='w'
             )

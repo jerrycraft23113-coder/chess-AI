@@ -517,7 +517,9 @@ def main():
     # Load existing model if provided
     if args.load_model and os.path.exists(args.load_model):
         try:
-            model.load_state_dict(torch.load(args.load_model, map_location=device))
+            state_dict = torch.load(args.load_model, map_location=device)
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
             print(f"Loaded model from {args.load_model}")
         except Exception as e:
             print(f"Warning: Could not load model: {e}")

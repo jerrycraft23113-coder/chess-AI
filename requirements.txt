@@ -4,3 +4,5 @@ python-chess
 customtkinter
 Pillow
 h5py
+
+#python setup_cy.py build_ext --inplace

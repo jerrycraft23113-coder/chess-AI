@@ -429,6 +429,93 @@ _B_PASSED_INT = [int(_BLACK_PASSED_MASKS[i]) for i in range(64)]
 _ADJ_FILE_INT = [int(_ADJ_FILE_MASKS[i]) for i in range(8)]
 
 
+# ─── Lightweight eval: material + PST only (for quiescence search) ────────
+
+def evaluate_material_pst(bb) -> float:
+    """Fast material + PST eval for quiescence. Skips pawn structure/king safety.
+    Takes a chess.Board directly (not ChessBoard wrapper). Returns score in pawns from white's perspective.
+    """
+    w_occ = int(bb.occupied_co[True])
+    b_occ = int(bb.occupied_co[False])
+    score = 0.0
+    w_pst = _W_PST_LIST
+    b_pst = _B_PST_LIST
+
+    # Pawns
+    tmp = int(bb.pawns) & w_occ
+    wp1 = w_pst[1]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 100.0 + wp1[sq]
+    tmp = int(bb.pawns) & b_occ
+    bp1 = b_pst[1]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 100.0 + bp1[sq]
+
+    # Knights
+    tmp = int(bb.knights) & w_occ
+    wp2 = w_pst[2]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 320.0 + wp2[sq]
+    tmp = int(bb.knights) & b_occ
+    bp2 = b_pst[2]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 320.0 + bp2[sq]
+
+    # Bishops
+    tmp = int(bb.bishops) & w_occ
+    wp3 = w_pst[3]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 330.0 + wp3[sq]
+    tmp = int(bb.bishops) & b_occ
+    bp3 = b_pst[3]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 330.0 + bp3[sq]
+
+    # Rooks
+    tmp = int(bb.rooks) & w_occ
+    wp4 = w_pst[4]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 500.0 + wp4[sq]
+    tmp = int(bb.rooks) & b_occ
+    bp4 = b_pst[4]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 500.0 + bp4[sq]
+
+    # Queens
+    tmp = int(bb.queens) & w_occ
+    wp5 = w_pst[5]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 900.0 + wp5[sq]
+    tmp = int(bb.queens) & b_occ
+    bp5 = b_pst[5]
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 900.0 + bp5[sq]
+
+    # Tempo
+    score += 10.0 if bb.turn else -10.0
+    return score * 0.01
+
+
 # ─── Main evaluation: maximum speed, bitboard-only ────────────────────────
 
 def evaluate_position_advanced(board: ChessBoard) -> float:
@@ -438,95 +525,138 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
     """
     bb = board.board
 
-    # ── Bitboard-based piece iteration (faster than piece_map()) ──
-    # Use occupied_co bitboards + bitboard iteration instead of piece_map()
+    # ── Per-piece-type bitboard iteration (avoids piece_type_at calls) ──
+    w_occ = int(bb.occupied_co[True])   # chess.WHITE
+    b_occ = int(bb.occupied_co[False])  # chess.BLACK
+
     phase = 0
     score = 0.0
     w_bishops = 0
     b_bishops = 0
     w_minors = 0
     b_minors = 0
-    wk_sq = 0
-    bk_sq = 0
-    w_pawns_by_file_0 = 0; w_pawns_by_file_1 = 0; w_pawns_by_file_2 = 0; w_pawns_by_file_3 = 0
-    w_pawns_by_file_4 = 0; w_pawns_by_file_5 = 0; w_pawns_by_file_6 = 0; w_pawns_by_file_7 = 0
-    b_pawns_by_file_0 = 0; b_pawns_by_file_1 = 0; b_pawns_by_file_2 = 0; b_pawns_by_file_3 = 0
-    b_pawns_by_file_4 = 0; b_pawns_by_file_5 = 0; b_pawns_by_file_6 = 0; b_pawns_by_file_7 = 0
-    w_rook_files = []
-    b_rook_files = []
 
     # Local refs
-    mat_list = _MAT_LIST
-    phase_list = _PHASE_LIST
     w_pst = _W_PST_LIST
     b_pst = _B_PST_LIST
 
-    # Use bb.piece_type_at() which is a fast C-level call
-    piece_type_at = bb.piece_type_at
+    # ── Kings (always exactly one per side) ──
+    wk_bb = int(bb.kings) & w_occ
+    wk_sq = (wk_bb & -wk_bb).bit_length() - 1
+    bk_bb = int(bb.kings) & b_occ
+    bk_sq = (bk_bb & -bk_bb).bit_length() - 1
 
-    # Iterate white pieces
-    w_occ = int(bb.occupied_co[True])  # chess.WHITE
-    tmp = w_occ
+    # ── White pawns ──
+    w_pawns_int = int(bb.pawns) & w_occ
+    w_pawns_by_file = [0, 0, 0, 0, 0, 0, 0, 0]
+    wp1 = w_pst[1]
+    tmp = w_pawns_int
     while tmp:
         sq = (tmp & -tmp).bit_length() - 1
         tmp &= tmp - 1
-        pt = piece_type_at(sq)
-        phase += phase_list[pt]
-        mat = mat_list[pt]
-        if pt == 6:  # KING
-            wk_sq = sq
-            score += mat
-        else:
-            score += mat + w_pst[pt][sq]
-        if pt == 1:  # PAWN
-            f = sq & 7
-            if f == 0: w_pawns_by_file_0 += 1
-            elif f == 1: w_pawns_by_file_1 += 1
-            elif f == 2: w_pawns_by_file_2 += 1
-            elif f == 3: w_pawns_by_file_3 += 1
-            elif f == 4: w_pawns_by_file_4 += 1
-            elif f == 5: w_pawns_by_file_5 += 1
-            elif f == 6: w_pawns_by_file_6 += 1
-            else: w_pawns_by_file_7 += 1
-        elif pt == 2:  # KNIGHT
-            w_minors += 1
-        elif pt == 3:  # BISHOP
-            w_bishops += 1
-            w_minors += 1
-        elif pt == 4:  # ROOK
-            w_rook_files.append(sq & 7)
+        score += 100.0 + wp1[sq]
+        w_pawns_by_file[sq & 7] += 1
 
-    # Iterate black pieces
-    b_occ = int(bb.occupied_co[False])  # chess.BLACK
-    tmp = b_occ
+    # ── Black pawns ──
+    b_pawns_int = int(bb.pawns) & b_occ
+    b_pawns_by_file = [0, 0, 0, 0, 0, 0, 0, 0]
+    bp1 = b_pst[1]
+    tmp = b_pawns_int
     while tmp:
         sq = (tmp & -tmp).bit_length() - 1
         tmp &= tmp - 1
-        pt = piece_type_at(sq)
-        phase += phase_list[pt]
-        mat = mat_list[pt]
-        if pt == 6:  # KING
-            bk_sq = sq
-            score -= mat
-        else:
-            score -= mat + b_pst[pt][sq]
-        if pt == 1:  # PAWN
-            f = sq & 7
-            if f == 0: b_pawns_by_file_0 += 1
-            elif f == 1: b_pawns_by_file_1 += 1
-            elif f == 2: b_pawns_by_file_2 += 1
-            elif f == 3: b_pawns_by_file_3 += 1
-            elif f == 4: b_pawns_by_file_4 += 1
-            elif f == 5: b_pawns_by_file_5 += 1
-            elif f == 6: b_pawns_by_file_6 += 1
-            else: b_pawns_by_file_7 += 1
-        elif pt == 2:  # KNIGHT
-            b_minors += 1
-        elif pt == 3:  # BISHOP
-            b_bishops += 1
-            b_minors += 1
-        elif pt == 4:  # ROOK
-            b_rook_files.append(sq & 7)
+        score -= 100.0 + bp1[sq]
+        b_pawns_by_file[sq & 7] += 1
+
+    # ── White knights (phase +1 each, minor) ──
+    w_knights_bb = int(bb.knights) & w_occ
+    wp2 = w_pst[2]
+    tmp = w_knights_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 320.0 + wp2[sq]
+        phase += 1
+        w_minors += 1
+
+    # ── Black knights ──
+    b_knights_bb = int(bb.knights) & b_occ
+    bp2 = b_pst[2]
+    tmp = b_knights_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 320.0 + bp2[sq]
+        phase += 1
+        b_minors += 1
+
+    # ── White bishops (phase +1 each, minor) ──
+    w_bishops_bb = int(bb.bishops) & w_occ
+    wp3 = w_pst[3]
+    tmp = w_bishops_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 330.0 + wp3[sq]
+        phase += 1
+        w_bishops += 1
+        w_minors += 1
+
+    # ── Black bishops ──
+    b_bishops_bb = int(bb.bishops) & b_occ
+    bp3 = b_pst[3]
+    tmp = b_bishops_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 330.0 + bp3[sq]
+        phase += 1
+        b_bishops += 1
+        b_minors += 1
+
+    # ── White rooks (phase +2 each) ──
+    w_rooks_bb = int(bb.rooks) & w_occ
+    wp4 = w_pst[4]
+    w_rook_files = []
+    tmp = w_rooks_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 500.0 + wp4[sq]
+        phase += 2
+        w_rook_files.append(sq & 7)
+
+    # ── Black rooks ──
+    b_rooks_bb = int(bb.rooks) & b_occ
+    bp4 = b_pst[4]
+    b_rook_files = []
+    tmp = b_rooks_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 500.0 + bp4[sq]
+        phase += 2
+        b_rook_files.append(sq & 7)
+
+    # ── White queens (phase +4 each) ──
+    w_queens_bb = int(bb.queens) & w_occ
+    wp5 = w_pst[5]
+    tmp = w_queens_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score += 900.0 + wp5[sq]
+        phase += 4
+
+    # ── Black queens ──
+    b_queens_bb = int(bb.queens) & b_occ
+    bp5 = b_pst[5]
+    tmp = b_queens_bb
+    while tmp:
+        sq = (tmp & -tmp).bit_length() - 1
+        tmp &= tmp - 1
+        score -= 900.0 + bp5[sq]
+        phase += 4
 
     # ── Game phase and king PST ──
     if phase > 24:
@@ -543,52 +673,17 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
     if b_bishops >= 2:
         score -= 50.0
 
-    # ── Pawn structure (unrolled for speed) ──
-    w_pawns_int = int(bb.pawns & w_occ)
-    b_pawns_int = int(bb.pawns & b_occ)
-
+    # ── Pawn structure ──
     adj = _ADJ_FILE_INT
-    # Doubled + isolated (unrolled 8 files)
-    wp = w_pawns_by_file_0; bp = b_pawns_by_file_0
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[0]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[0]): score += 15.0 * bp
-    wp = w_pawns_by_file_1; bp = b_pawns_by_file_1
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[1]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[1]): score += 15.0 * bp
-    wp = w_pawns_by_file_2; bp = b_pawns_by_file_2
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[2]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[2]): score += 15.0 * bp
-    wp = w_pawns_by_file_3; bp = b_pawns_by_file_3
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[3]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[3]): score += 15.0 * bp
-    wp = w_pawns_by_file_4; bp = b_pawns_by_file_4
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[4]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[4]): score += 15.0 * bp
-    wp = w_pawns_by_file_5; bp = b_pawns_by_file_5
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[5]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[5]): score += 15.0 * bp
-    wp = w_pawns_by_file_6; bp = b_pawns_by_file_6
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[6]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[6]): score += 15.0 * bp
-    wp = w_pawns_by_file_7; bp = b_pawns_by_file_7
-    if wp > 1: score -= 20.0 * (wp - 1)
-    if bp > 1: score += 20.0 * (bp - 1)
-    if wp and not (w_pawns_int & adj[7]): score -= 15.0 * wp
-    if bp and not (b_pawns_int & adj[7]): score += 15.0 * bp
+    w_pbf = w_pawns_by_file
+    b_pbf = b_pawns_by_file
+    for f in range(8):
+        wp = w_pbf[f]; bp = b_pbf[f]
+        a = adj[f]
+        if wp > 1: score -= 20.0 * (wp - 1)
+        if bp > 1: score += 20.0 * (bp - 1)
+        if wp and not (w_pawns_int & a): score -= 15.0 * wp
+        if bp and not (b_pawns_int & a): score += 15.0 * bp
 
     # ── Passed pawns ──
     w_passed = _W_PASSED_INT
@@ -611,16 +706,12 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
             tmp &= tmp - 1
 
     # ── Rook on open / semi-open files ──
-    w_pf = (w_pawns_by_file_0, w_pawns_by_file_1, w_pawns_by_file_2, w_pawns_by_file_3,
-            w_pawns_by_file_4, w_pawns_by_file_5, w_pawns_by_file_6, w_pawns_by_file_7)
-    b_pf = (b_pawns_by_file_0, b_pawns_by_file_1, b_pawns_by_file_2, b_pawns_by_file_3,
-            b_pawns_by_file_4, b_pawns_by_file_5, b_pawns_by_file_6, b_pawns_by_file_7)
     for f in w_rook_files:
-        if w_pf[f] == 0:
-            score += 25.0 if b_pf[f] == 0 else 15.0
+        if w_pbf[f] == 0:
+            score += 25.0 if b_pbf[f] == 0 else 15.0
     for f in b_rook_files:
-        if b_pf[f] == 0:
-            score -= 25.0 if w_pf[f] == 0 else 15.0
+        if b_pbf[f] == 0:
+            score -= 25.0 if w_pbf[f] == 0 else 15.0
 
     # ── Center control ──
     w_center = _popcount(w_occ & _CENTER_MASK)
@@ -639,13 +730,11 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
             ff = kf + df
             if 0 > ff or ff > 7:
                 continue
-            if w_pf[ff] == 0:
+            if w_pbf[ff] == 0:
                 score -= 15.0 * sf
-                # Fully open file (no enemy pawn either) - extra penalty
-                if b_pf[ff] == 0:
+                if b_pbf[ff] == 0:
                     score -= 5.0 * sf
                 else:
-                    # Semi-open (own pawn missing, enemy pawn present) - extra penalty
                     score -= 10.0 * sf
         # Black king pawn shield + open file penalties
         kf = bk_sq & 7
@@ -653,9 +742,9 @@ def evaluate_position_advanced(board: ChessBoard) -> float:
             ff = kf + df
             if 0 > ff or ff > 7:
                 continue
-            if b_pf[ff] == 0:
+            if b_pbf[ff] == 0:
                 score += 15.0 * sf
-                if w_pf[ff] == 0:
+                if w_pbf[ff] == 0:
                     score += 5.0 * sf
                 else:
                     score += 10.0 * sf

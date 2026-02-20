@@ -12,7 +12,16 @@ import math
 import logging
 from pathlib import Path
 
-from chess_board import ChessBoard, evaluate_position_advanced, PIECE_VALUES
+# Cache hot builtins at module level to avoid attribute lookups in tight loops
+_time = time.time
+def _sleep0():
+    time.sleep(0)
+
+from chess_board import ChessBoard, PIECE_VALUES
+try:
+    from eval_cy import cy_evaluate_position_advanced as evaluate_position_advanced, cy_evaluate_material_pst as evaluate_material_pst
+except ImportError:
+    from chess_board import evaluate_position_advanced, evaluate_material_pst
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +60,8 @@ for _v in range(1, 7):
 
 # ── Futility/LMP margins ──────────────────────────────────────
 _FUTILITY_MARGIN = [0, 200, 350, 500]  # depth 0,1,2,3
-_LMP_COUNTS = [0, 5, 8, 13, 20]  # late move pruning thresholds per depth
+_RFP_MARGIN = (0.0, 2.0, 3.5, 5.0, 7.0)  # reverse futility margins in pawns, depth 0-4
+_LMP_COUNTS = [0, 4, 7, 11, 17]  # late move pruning thresholds per depth
 
 # Precompute LMR reduction table (log formula)
 _LMR_TABLE = [[0]*64 for _ in range(MAX_DEPTH)]
@@ -66,6 +76,10 @@ def _eval_fast(bb: chess.Board) -> float:
     """Evaluate from WHITE perspective."""
     _EVAL_WRAPPER.board = bb
     return evaluate_position_advanced(_EVAL_WRAPPER)
+
+# ── Cache frequently used chess module attributes ─────────────
+_Move_null = chess.Move.null
+_NULL_MOVE = chess.Move.null()
 
 
 # ── Play style definitions ────────────────────────────────────
@@ -85,15 +99,17 @@ class ChessAI:
         self.depth = depth
         self.classical_weight = max(0.0, min(1.0, classical_weight))
         self.time_limit = time_limit
+        self._tl = time_limit  # cached for hot path
         self.play_style = play_style
 
-        # Transposition table (generation-based eviction)
+        # Transposition table (dict-based, generation eviction)
         self.tt: dict = {}
         self.tt_max_size = 8_000_000
         self.tt_generation = 0
 
-        # Killer moves
-        self.killers = [[None, None] for _ in range(MAX_DEPTH)]
+
+        # Killer moves (stored as integer keys: from | to<<6 | promo<<12)
+        self.killers = [[0, 0] for _ in range(MAX_DEPTH)]
 
         # History heuristic
         self.hist_w = np.zeros((64, 64), dtype=np.int32)
@@ -115,7 +131,10 @@ class ChessAI:
             self.model = ChessCNN(hidden_size=256)
             if model_path:
                 try:
-                    self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
+                    state_dict = torch.load(model_path, map_location='cpu')
+                    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+                    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+                    self.model.load_state_dict(state_dict)
                     print(f"Loaded model from {model_path}")
                 except (FileNotFoundError, RuntimeError, ValueError) as e:
                     print(f"Warning: Could not load model: {e}")
@@ -134,14 +153,14 @@ class ChessAI:
 
     def _quiesce(self, bb, alpha, beta, qdepth=0):
         self.nodes += 1
-        if (self.nodes & 4095) == 0:
-            if self.time_limit > 0 and time.time() - self.start_time >= self.time_limit:
+        if (self.nodes & 65535) == 0:
+            if self._tl > 0 and _time() - self.start_time >= self._tl:
                 self.time_up = True
                 return 0.0
-            time.sleep(0)
+            _sleep0()
 
-        # Stand-pat
-        score = _eval_fast(bb)
+        # Stand-pat (fast material+PST eval for quiescence)
+        score = evaluate_material_pst(bb)
         if not bb.turn:
             score = -score
 
@@ -153,35 +172,38 @@ class ChessAI:
         if qdepth >= 3:
             return alpha
 
-        # Captures only, sorted by MVV-LVA inline
+        # Big delta pruning: even capturing a queen won't help
+        if score + 9.75 < alpha:
+            return alpha
+
+        # Use generate_legal_captures() - avoids generating non-capture moves entirely
         mvvlva = _MVV_LVA
         pta = bb.piece_type_at
         caps = []
         idx = 0
-        for m in bb.legal_moves:
-            if bb.is_capture(m):
-                c_pt = pta(m.to_square)
-                a_pt = pta(m.from_square)
-                if c_pt and a_pt:
-                    caps.append((mvvlva[c_pt][a_pt], idx, m))
-                else:
-                    caps.append((0, idx, m))
-                idx += 1
+        for m in bb.generate_legal_captures():
+            c_pt = pta(m.to_square)
+            a_pt = pta(m.from_square)
+            if c_pt and a_pt:
+                caps.append((mvvlva[c_pt][a_pt], idx, m, c_pt))
+            else:
+                caps.append((0, idx, m, c_pt or 0))
+            idx += 1
         if not caps:
             return alpha
 
         caps.sort(reverse=True)
 
         pv = _PV
-        for _, _, move in caps:
-            # Delta pruning
-            c_pt = pta(move.to_square)
+        quiesce = self._quiesce
+        for _, _, move, c_pt in caps:
+            # Delta pruning (c_pt cached from scoring above)
             if c_pt:
                 if score + pv[c_pt] * 0.01 + 2.0 < alpha:
                     continue
 
             bb.push(move)
-            s = -self._quiesce(bb, -beta, -alpha, qdepth + 1)
+            s = -quiesce(bb, -beta, -alpha, qdepth + 1)
             bb.pop()
 
             if self.time_up:
@@ -195,15 +217,15 @@ class ChessAI:
 
     # ── Negamax ────────────────────────────────────────────────
 
-    def _negamax(self, bb, depth, alpha, beta, do_null=True, prev_move=None):
+    def _negamax(self, bb, depth, alpha, beta, do_null=True, prev_move_key=0):
         self.nodes += 1
 
-        # Time check every 4096 nodes + yield GIL so GUI stays responsive
-        if (self.nodes & 4095) == 0:
-            if self.time_limit > 0 and time.time() - self.start_time >= self.time_limit:
+        # Time check every 65536 nodes + yield GIL so GUI stays responsive
+        if (self.nodes & 65535) == 0:
+            if self._tl > 0 and _time() - self.start_time >= self._tl:
                 self.time_up = True
                 return 0.0
-            time.sleep(0)
+            _sleep0()
 
         # Check extension
         in_check = bb.is_check()
@@ -219,10 +241,13 @@ class ChessAI:
         tt = self.tt
         tt_key = bb._transposition_key()
         tt_move = None
+        tt_move_key = 0
         entry = tt.get(tt_key)
         if entry is not None:
             e_depth, e_score, e_flag, e_move, _gen = entry
             tt_move = e_move
+            if tt_move is not None:
+                tt_move_key = e_move.from_square | (e_move.to_square << 6) | ((e_move.promotion or 0) << 12)
             if e_depth >= depth and not is_pv:
                 if e_flag == 0:  # EXACT
                     return e_score
@@ -231,10 +256,15 @@ class ChessAI:
                 elif e_flag == 2 and e_score >= beta:  # LOWER
                     return e_score
 
-        # Static eval (only compute once)
-        static_eval = _eval_fast(bb)
-        if not bb.turn:
-            static_eval = -static_eval
+        # Static eval (skip when in check — all pruning has 'not in_check' guard)
+        if in_check:
+            static_eval = 0.0
+        else:
+            _ew = _EVAL_WRAPPER
+            _ew.board = bb
+            static_eval = evaluate_position_advanced(_ew)
+            if not bb.turn:
+                static_eval = -static_eval
 
         # Razoring at depth 1-2
         if not in_check and not is_pv and depth <= 2:
@@ -250,13 +280,15 @@ class ChessAI:
             if static_eval - margin >= beta:
                 return static_eval - margin
 
-        # Null-move pruning
+        # Null-move pruning with adaptive R
         if (do_null and depth >= 3 and not in_check
                 and static_eval >= beta):
             # Quick endgame check via queens bitboard
             if bb.queens:
-                R = 3 if depth >= 6 else 2
-                bb.push(chess.Move.null())
+                R = 2 + depth // 4  # adaptive: R=2 at d3, R=3 at d4-7, R=4 at d8+
+                if R > depth - 1:
+                    R = depth - 1
+                bb.push(_NULL_MOVE)
                 ns = -self._negamax(bb, depth - 1 - R, -beta, -beta + 0.01,
                                     do_null=False)
                 bb.pop()
@@ -265,6 +297,59 @@ class ChessAI:
                 if ns >= beta:
                     return beta
 
+        # Precompute capture mask (opponent occupied + ep square)
+        opp_occ = int(bb.occupied_co[not bb.turn])
+        ep = bb.ep_square
+        if ep is not None:
+            opp_occ |= (1 << ep)
+
+        killers = self.killers
+        counter = self.counter_moves
+        hist = self.hist_w if bb.turn else self.hist_b
+        pta = bb.piece_type_at
+        mvvlva = _MVV_LVA
+        negamax = self._negamax
+
+        best_score = -INFINITY
+        best_move = None
+        move_count = 0
+        raised_alpha = False
+        tt_searched = False
+
+        # ── Try TT move first (avoid full move generation at cut nodes) ──
+        if tt_move is not None and bb.is_legal(tt_move):
+            tt_searched = True
+            move_count = 1
+            is_cap_tt = bool((1 << tt_move.to_square) & opp_occ)
+
+            bb.push(tt_move)
+            best_score = -negamax(bb, depth - 1, -beta, -alpha, prev_move_key=tt_move_key)
+            bb.pop()
+
+            if self.time_up:
+                return 0.0
+
+            best_move = tt_move
+            if best_score > alpha:
+                alpha = best_score
+                raised_alpha = True
+
+            if alpha >= beta:
+                # Beta cutoff from TT move — skip generating remaining moves
+                if not is_cap_tt:
+                    if depth < MAX_DEPTH and killers[depth][0] != tt_move_key:
+                        killers[depth][1] = killers[depth][0]
+                        killers[depth][0] = tt_move_key
+                    bonus = depth * depth
+                    val = hist[tt_move.from_square, tt_move.to_square]
+                    hist[tt_move.from_square, tt_move.to_square] = min(val + bonus, 1_000_000)
+                    if prev_move_key:
+                        counter[prev_move_key] = tt_move_key
+                old = tt.get(tt_key)
+                if old is None or old[0] <= depth:
+                    tt[tt_key] = (depth, best_score, 2, best_move, self.tt_generation)
+                return best_score
+
         # Generate legal moves
         legal_moves = list(bb.legal_moves)
         if not legal_moves:
@@ -272,53 +357,56 @@ class ChessAI:
                 return -MATE_SCORE + (MAX_DEPTH - depth)
             return 0.0
 
+        if best_move is None:
+            best_move = legal_moves[0]
+
         # IID: if no TT move at PV node, do a shallow search
         if is_pv and tt_move is None and depth >= 4:
-            self._negamax(bb, depth - 2, alpha, beta, do_null=False, prev_move=prev_move)
+            self._negamax(bb, depth - 2, alpha, beta, do_null=False, prev_move_key=prev_move_key)
             if self.time_up:
                 return 0.0
             e2 = tt.get(tt_key)
             if e2 is not None:
-                tt_move = e2[3]  # move is at index 3 in 5-tuple
+                tt_move = e2[3]
+                if tt_move is not None:
+                    tt_move_key = tt_move.from_square | (tt_move.to_square << 6) | ((tt_move.promotion or 0) << 12)
 
-        # ── Move ordering (inline for speed) ──
-        killers = self.killers
-        counter = self.counter_moves
-        hist = self.hist_w if bb.turn else self.hist_b
-        pta = bb.piece_type_at
-        is_cap = bb.is_capture
-        mvvlva = _MVV_LVA
-
+        # ── Move ordering with integer key comparisons ──
         scored_moves = []
         idx = 0
+        k0 = killers[depth][0] if depth < MAX_DEPTH else 0
+        k1 = killers[depth][1] if depth < MAX_DEPTH else 0
+        cm_key = counter.get(prev_move_key, 0)
         for m in legal_moves:
-            if tt_move and m == tt_move:
-                scored_moves.append((10_000_000, idx, m))
-            elif is_cap(m):
-                c_pt = pta(m.to_square)
-                a_pt = pta(m.from_square)
+            m_from = m.from_square
+            m_to = m.to_square
+            m_key = m_from | (m_to << 6) | ((m.promotion or 0) << 12)
+            if tt_searched and m_key == tt_move_key:
+                idx += 1
+                continue  # Already searched
+            cap = bool((1 << m_to) & opp_occ)
+            if not tt_searched and tt_move_key and m_key == tt_move_key:
+                scored_moves.append((10_000_000, idx, m, cap, m_key))
+            elif cap:
+                c_pt = pta(m_to)
+                a_pt = pta(m_from)
                 s = 1_000_000
                 if c_pt and a_pt:
                     s += mvvlva[c_pt][a_pt]
-                scored_moves.append((s, idx, m))
+                scored_moves.append((s, idx, m, True, m_key))
             elif m.promotion:
-                scored_moves.append((900_000, idx, m))
-            elif depth < MAX_DEPTH and killers[depth][0] == m:
-                scored_moves.append((700_000, idx, m))
-            elif depth < MAX_DEPTH and killers[depth][1] == m:
-                scored_moves.append((600_000, idx, m))
-            elif prev_move and counter.get(prev_move) == m:
-                scored_moves.append((550_000, idx, m))
+                scored_moves.append((900_000, idx, m, False, m_key))
+            elif m_key == k0:
+                scored_moves.append((700_000, idx, m, False, m_key))
+            elif m_key == k1:
+                scored_moves.append((600_000, idx, m, False, m_key))
+            elif cm_key and cm_key == m_key:
+                scored_moves.append((550_000, idx, m, False, m_key))
             else:
-                scored_moves.append((int(hist[m.from_square, m.to_square]), idx, m))
+                scored_moves.append((int(hist[m_from, m_to]), idx, m, False, m_key))
             idx += 1
 
         scored_moves.sort(reverse=True)
-
-        best_score = -INFINITY
-        best_move = scored_moves[0][2]
-        move_count = 0
-        raised_alpha = False
 
         # Futility pruning flag
         can_futility = not in_check and not is_pv and depth <= 3 and abs(alpha) < MATE_SCORE - 100
@@ -331,9 +419,8 @@ class ChessAI:
         # LMR table
         lmr_tab = _LMR_TABLE[min(depth, MAX_DEPTH - 1)]
 
-        for _, _, move in scored_moves:
+        for _, _, move, is_capture, m_key in scored_moves:
             move_count += 1
-            is_capture = is_cap(move)
             is_promo = move.promotion is not None
 
             # Late move pruning
@@ -350,7 +437,7 @@ class ChessAI:
             if depth >= 3 and move_count > 3 and not in_check and not is_capture and not is_promo:
                 reduction = lmr_tab[min(move_count, 63)]
                 # Reduce less for killers
-                if depth < MAX_DEPTH and (killers[depth][0] == move or killers[depth][1] == move):
+                if k0 == m_key or k1 == m_key:
                     reduction = max(0, reduction - 1)
                 # Don't reduce below 1
                 reduction = min(reduction, depth - 2)
@@ -359,17 +446,17 @@ class ChessAI:
 
             # PVS
             if move_count == 1:
-                score = -self._negamax(bb, depth - 1, -beta, -alpha,
-                                       prev_move=move)
+                score = -negamax(bb, depth - 1, -beta, -alpha,
+                                 prev_move_key=m_key)
             else:
                 # Scout search with reduction
-                score = -self._negamax(bb, depth - 1 - reduction,
-                                       -alpha - 0.01, -alpha,
-                                       prev_move=move)
+                score = -negamax(bb, depth - 1 - reduction,
+                                 -alpha - 0.01, -alpha,
+                                 prev_move_key=m_key)
                 # Re-search if failed high
                 if score > alpha and (reduction > 0 or score < beta):
-                    score = -self._negamax(bb, depth - 1, -beta, -alpha,
-                                           prev_move=move)
+                    score = -negamax(bb, depth - 1, -beta, -alpha,
+                                     prev_move_key=m_key)
 
             bb.pop()
 
@@ -386,17 +473,17 @@ class ChessAI:
 
             if alpha >= beta:
                 if not is_capture:
-                    # Killer
-                    if depth < MAX_DEPTH and killers[depth][0] != move:
+                    # Killer (integer key)
+                    if depth < MAX_DEPTH and killers[depth][0] != m_key:
                         killers[depth][1] = killers[depth][0]
-                        killers[depth][0] = move
+                        killers[depth][0] = m_key
                     # History bonus
                     bonus = depth * depth
                     val = hist[move.from_square, move.to_square]
                     hist[move.from_square, move.to_square] = min(val + bonus, 1_000_000)
-                    # Counter-move
-                    if prev_move:
-                        counter[prev_move] = move
+                    # Counter-move (integer key)
+                    if prev_move_key:
+                        counter[prev_move_key] = m_key
                 break
 
         # TT store
@@ -410,7 +497,6 @@ class ChessAI:
         old = tt.get(tt_key)
         if old is None or old[0] <= depth:
             if len(tt) > self.tt_max_size:
-                # Generation-based eviction: remove old entries instead of clearing all
                 gen = self.tt_generation
                 to_del = [k for k, v in tt.items() if v[4] < gen - 2]
                 for k in to_del:
@@ -449,7 +535,7 @@ class ChessAI:
         self.time_up = False
         self.start_time = time.time()
         self.best_root = legal_moves[0]
-        self.killers = [[None, None] for _ in range(MAX_DEPTH)]
+        self.killers = [[0, 0] for _ in range(MAX_DEPTH)]
         self.tt_generation += 1
 
         # Age history
@@ -514,35 +600,45 @@ class ChessAI:
         tt = self.tt
         tt_key = bb._transposition_key()
         tt_move = None
+        tt_move_key = 0
         entry = tt.get(tt_key)
         if entry is not None:
-            tt_move = entry[3]  # move is at index 3 in 5-tuple
+            tt_move = entry[3]
+            if tt_move is not None:
+                tt_move_key = tt_move.from_square | (tt_move.to_square << 6) | ((tt_move.promotion or 0) << 12)
 
-        # Move ordering
+        # Move ordering (bitboard capture check + integer key comparisons)
         hist = self.hist_w if bb.turn else self.hist_b
-        is_cap = bb.is_capture
         pta = bb.piece_type_at
         mvvlva = _MVV_LVA
         br = self.best_root
+        br_key = (br.from_square | (br.to_square << 6) | ((br.promotion or 0) << 12)) if br else 0
+        opp_occ = int(bb.occupied_co[not bb.turn])
+        ep = bb.ep_square
+        if ep is not None:
+            opp_occ |= (1 << ep)
 
         scored = []
         idx = 0
         for m in legal_moves:
-            if tt_move and m == tt_move:
-                scored.append((10_000_000, idx, m))
-            elif br and m == br:
-                scored.append((9_000_000, idx, m))
-            elif is_cap(m):
-                c_pt = pta(m.to_square)
-                a_pt = pta(m.from_square)
+            m_from = m.from_square
+            m_to = m.to_square
+            m_key = m_from | (m_to << 6) | ((m.promotion or 0) << 12)
+            if tt_move_key and m_key == tt_move_key:
+                scored.append((10_000_000, idx, m, m_key))
+            elif br_key and m_key == br_key:
+                scored.append((9_000_000, idx, m, m_key))
+            elif (1 << m_to) & opp_occ:
+                c_pt = pta(m_to)
+                a_pt = pta(m_from)
                 s = 1_000_000
                 if c_pt and a_pt:
                     s += mvvlva[c_pt][a_pt]
-                scored.append((s, idx, m))
+                scored.append((s, idx, m, m_key))
             elif m.promotion:
-                scored.append((900_000, idx, m))
+                scored.append((900_000, idx, m, m_key))
             else:
-                scored.append((int(hist[m.from_square, m.to_square]), idx, m))
+                scored.append((int(hist[m_from, m_to]), idx, m, m_key))
             idx += 1
 
         scored.sort(reverse=True)
@@ -551,20 +647,20 @@ class ChessAI:
         move_count = 0
         root_scores = []  # Collect (score, move) for style selection
 
-        for _, _, move in scored:
+        for _, _, move, m_key in scored:
             move_count += 1
 
             bb.push(move)
 
             if move_count == 1:
                 score = -self._negamax(bb, depth - 1, -beta, -alpha,
-                                       prev_move=move)
+                                       prev_move_key=m_key)
             else:
                 score = -self._negamax(bb, depth - 1, -alpha - 0.01, -alpha,
-                                       prev_move=move)
+                                       prev_move_key=m_key)
                 if score > alpha and score < beta:
                     score = -self._negamax(bb, depth - 1, -beta, -alpha,
-                                           prev_move=move)
+                                           prev_move_key=m_key)
 
             bb.pop()
 
