@@ -19,26 +19,83 @@ from chess_model import ChessCNN
 import chess
 
 
+def _bitboards_to_tensor(bbs: np.ndarray) -> torch.Tensor:
+    """Decode (12,) uint64 bitboards → (12, 8, 8) float32 tensor.
+
+    Each uint64 is a chess bitboard: bit i → square i (rank = i//8, file = i%8).
+    Output layout: tensor[ch, 7 - rank, file] = 1.0 (matching chess_board.py).
+    """
+    out = torch.zeros(12, 8, 8, dtype=torch.float32)
+    for ch in range(12):
+        mask = int(bbs[ch])
+        if mask == 0:
+            continue
+        while mask:
+            sq = (mask & -mask).bit_length() - 1
+            out[ch, 7 - (sq >> 3), sq & 7] = 1.0
+            mask &= mask - 1
+    return out
+
+
+# Vectorized version for batch decoding (used for in-memory datasets)
+_BITS = np.arange(64, dtype=np.uint64)
+
+def _bitboards_batch_to_array(bbs: np.ndarray) -> np.ndarray:
+    """Decode (N, 12) uint64 bitboards → (N, 12, 8, 8) float32 array (vectorized)."""
+    n = bbs.shape[0]
+    # (N, 12, 1) >> (64,) → (N, 12, 64) then & 1
+    expanded = ((bbs[:, :, np.newaxis] >> _BITS) & np.uint64(1)).astype(np.float32)
+    # Reshape 64 → 8x8 then flip rank: bit i → rank i//8, file i%8 → [7-rank, file]
+    expanded = expanded.reshape(n, 12, 8, 8)
+    expanded = expanded[:, :, ::-1, :]  # flip rank axis (7-rank)
+    return np.ascontiguousarray(expanded)
+
+
 class ChessDataset(Dataset):
-    """Dataset for chess positions and evaluations."""
+    """Dataset for chess positions and evaluations.
+
+    Supports three storage formats:
+      - Bitboard (N, 12) uint64 — compact, decoded on-the-fly (preferred)
+      - Float (N, 8, 8, 12) or (N, 12, 8, 8) — legacy, loaded as tensors
+    Handles both in-memory and memory-mapped numpy arrays.
+    """
 
     def __init__(self, positions: np.ndarray, evaluations: np.ndarray):
-        """Initialize dataset.
+        self._is_mmap = isinstance(positions, np.memmap)
+        self._is_bitboard = (positions.dtype == np.uint64 and
+                             (positions.ndim == 2 or positions.ndim == 1))
 
-        Args:
-            positions: numpy array of shape (N, 8, 8, 12) or (N, 12, 8, 8)
-            evaluations: numpy array of shape (N,)
-        """
-        if positions.ndim == 4 and positions.shape[-1] == 12:
-            # Convert (N, 8, 8, 12) → (N, 12, 8, 8) once upfront
-            positions = positions.transpose(0, 3, 1, 2)
-        self.positions = torch.FloatTensor(positions)
-        self.evaluations = torch.FloatTensor(evaluations)
+        if self._is_mmap:
+            # Keep as mmap — decode lazily in __getitem__
+            self.positions = positions
+            self.evaluations = evaluations
+        elif self._is_bitboard:
+            # Bitboard in RAM — decode full batch upfront to float tensors
+            print(f"  Decoding {len(positions):,} bitboard positions to tensors...")
+            arr = _bitboards_batch_to_array(positions)  # (N, 12, 8, 8)
+            self.positions = torch.from_numpy(arr)
+            self.evaluations = torch.FloatTensor(np.array(evaluations, dtype=np.float32))
+        else:
+            # Legacy float format
+            if positions.ndim == 4 and positions.shape[-1] == 12:
+                positions = positions.transpose(0, 3, 1, 2)
+            self.positions = torch.FloatTensor(positions)
+            self.evaluations = torch.FloatTensor(evaluations)
 
     def __len__(self):
         return len(self.positions)
 
     def __getitem__(self, idx):
+        if self._is_mmap:
+            ev = torch.tensor(float(self.evaluations[idx]), dtype=torch.float32)
+            if self._is_bitboard:
+                pos = _bitboards_to_tensor(np.array(self.positions[idx]))
+            else:
+                pos = np.array(self.positions[idx])
+                if pos.ndim == 3 and pos.shape[-1] == 12:
+                    pos = pos.transpose(2, 0, 1)
+                pos = torch.from_numpy(pos.copy())
+            return pos, ev
         return self.positions[idx], self.evaluations[idx]
 
 
@@ -150,16 +207,38 @@ def train_model(
 
 
 def load_training_data_from_file(data_path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load training data from numpy file (direct numpy arrays, no per-element loop).
+    """Load training data from numpy file(s).
+
+    Supports two formats:
+      1. Legacy .npz file (single file with 'positions' and 'evaluations' keys)
+      2. Memory-mapped .npy files (positions.npy + evaluations.npy in same dir)
+         — preferred for large datasets since they never need to fit in RAM.
 
     Args:
-        data_path: Path to .npz file containing training data
+        data_path: Path to .npz file or directory containing .npy files
 
     Returns:
-        Tuple of (positions, evaluations) as numpy arrays
+        Tuple of (positions, evaluations) as numpy arrays (may be mmap'd)
     """
-    print(f"Loading training data from {data_path}...")
+    data_dir = os.path.dirname(data_path) or 'data'
+    pos_npy = os.path.join(data_dir, 'positions.npy')
+    eval_npy = os.path.join(data_dir, 'evaluations.npy')
 
+    # Prefer .npy memory-mapped files (created by parse_pgn_data merge)
+    if os.path.exists(pos_npy) and os.path.exists(eval_npy):
+        print(f"Loading memory-mapped training data from {data_dir}/...")
+        try:
+            positions = np.load(pos_npy, mmap_mode='r')      # (N, 12) uint64 bitboards
+            evaluations = np.load(eval_npy, mmap_mode='r')    # (N,)
+            fmt = "bitboard" if positions.dtype == np.uint64 else "float32"
+            size_mb = os.path.getsize(pos_npy) / (1024 * 1024)
+            print(f"Loaded {len(positions):,} positions (memory-mapped, {fmt}, {size_mb:.0f} MB)")
+            return positions, evaluations
+        except Exception as e:
+            print(f"Error loading .npy files: {e}, falling back to .npz")
+
+    # Fallback: legacy .npz file
+    print(f"Loading training data from {data_path}...")
     try:
         data = np.load(data_path, mmap_mode='r')
         positions = np.array(data['positions'])  # (N, 8, 8, 12)
@@ -216,14 +295,17 @@ def run_training(
         print(f"Using device: {device}")
     
     # Load training data (must be created from PGN with parse_pgn_data.py)
-    if not os.path.exists(data_path):
-        print(f"\nError: Training data file not found: {data_path}")
+    data_dir = os.path.dirname(data_path) or 'data'
+    has_npy = (os.path.exists(os.path.join(data_dir, 'positions.npy'))
+               and os.path.exists(os.path.join(data_dir, 'evaluations.npy')))
+    if not has_npy and not os.path.exists(data_path):
+        print(f"\nError: Training data not found at {data_path} or {data_dir}/positions.npy")
         print("Please run:")
         print("  1. python download_pgn_data.py  (to download PGN files)")
-        print("  2. python parse_pgn_data.py    (to parse PGN files and create training_data.npz)")
-        print("\nThen run this training script again pointing --data to the generated .npz file.")
+        print("  2. python parse_pgn_data.py    (to parse PGN files and create training data)")
+        print("\nThen run this training script again.")
         return
-    
+
     positions, evaluations = load_training_data_from_file(data_path)
 
     if len(positions) == 0:
@@ -231,9 +313,11 @@ def run_training(
         print("Please check that parse_pgn_data.py completed successfully and produced non-empty data.")
         return
 
-    # Data augmentation (horizontal mirror)
-    if augment:
+    # Data augmentation (horizontal mirror) — skip for mmap (too large for in-memory concat)
+    if augment and not isinstance(positions, np.memmap):
         positions, evaluations = mirror_positions(positions, evaluations)
+    elif augment:
+        print("  Skipping augmentation (memory-mapped data too large for in-memory concat)")
 
     # Split into train and validation
     split_idx = int(len(positions) * 0.8)
