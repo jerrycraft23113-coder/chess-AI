@@ -24,7 +24,7 @@ from pathlib import Path
 from PIL import Image, ImageTk
 
 from chess_board import ChessBoard
-from play_chess import ChessAI, PLAY_STYLES, STYLE_NORMAL
+from play_chess import ChessAI, PLAY_STYLES, STYLE_RANDOM
 
 logger = logging.getLogger(__name__)
 
@@ -1002,7 +1002,7 @@ class ChessGUI:
             'defensive': 'Defensive',
             'random': 'Random',
         }
-        style_var = tk.StringVar(value=getattr(self.ai, 'play_style', STYLE_NORMAL))
+        style_var = tk.StringVar(value=getattr(self.ai, 'play_style', STYLE_RANDOM))
         style_menu = tk.OptionMenu(main_frame, style_var,
                                    *[s for s in PLAY_STYLES])
         style_menu.config(font=('Arial', 18), width=12)
