@@ -408,14 +408,14 @@ def run_training(
         )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, sampler=train_sampler,
-            num_workers=num_workers, pin_memory=pin,
+            num_workers=num_workers, pin_memory=pin, drop_last=True,
             persistent_workers=(num_workers > 0), collate_fn=collate,
             prefetch_factor=2 if num_workers > 0 else None,
         )
     else:
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=pin,
+            num_workers=num_workers, pin_memory=pin, drop_last=True,
             persistent_workers=(num_workers > 0), collate_fn=collate,
             prefetch_factor=2 if num_workers > 0 else None,
         )
