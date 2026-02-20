@@ -87,16 +87,17 @@ class ChessDataset(Dataset):
 
     def __getitem__(self, idx):
         if self._is_mmap:
-            ev = torch.tensor(float(self.evaluations[idx]), dtype=torch.float32)
-            if self._is_bitboard:
-                pos = _bitboards_to_tensor(np.array(self.positions[idx]))
-            else:
-                pos = np.array(self.positions[idx])
-                if pos.ndim == 3 and pos.shape[-1] == 12:
-                    pos = pos.transpose(2, 0, 1)
-                pos = torch.from_numpy(pos.copy())
-            return pos, ev
+            # Return raw numpy for mmap — decoded in collate_fn for speed
+            return np.array(self.positions[idx]), float(self.evaluations[idx])
         return self.positions[idx], self.evaluations[idx]
+
+
+def _collate_mmap_bitboard(batch):
+    """Custom collate that batch-decodes bitboard positions (vectorized)."""
+    bbs = np.stack([b[0] for b in batch])            # (B, 12) uint64
+    evals = np.array([b[1] for b in batch], dtype=np.float32)  # (B,)
+    pos_tensor = torch.from_numpy(_bitboards_batch_to_array(bbs))  # (B, 12, 8, 8)
+    return pos_tensor, torch.from_numpy(evals)
 
 
 def train_model(
@@ -123,11 +124,14 @@ def train_model(
 
     # OneCycleLR: much faster convergence than StepLR
     total_steps = num_epochs * len(train_loader) if num_epochs > 0 else 1000
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=learning_rate * 10,
-        total_steps=total_steps, pct_start=0.3,
-        anneal_strategy='cos',
-    )
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=learning_rate * 10,
+            total_steps=total_steps, pct_start=0.3,
+            anneal_strategy='cos',
+        )
 
     # Mixed precision (AMP) — works on both CPU & CUDA
     use_amp = (device != 'cpu')
@@ -274,7 +278,7 @@ def run_training(
     epochs: int = 20,
     batch_size: int = 128,
     lr: float = 0.001,
-    use_cpu: bool = True,
+    use_cpu: bool = False,
     augment: bool = False,
 ):
     """Run the full supervised training pipeline.
@@ -330,16 +334,21 @@ def run_training(
     train_dataset = ChessDataset(train_positions, train_evaluations)
     val_dataset = ChessDataset(val_positions, val_evaluations)
 
-    # Optimized DataLoader: larger batch, multi-worker prefetch, pin_memory for CUDA
+    # Optimized DataLoader: multi-worker prefetch, pin_memory for CUDA
+    # Disable workers for mmap datasets — Windows spawn copies the whole mmap per worker
+    is_mmap = train_dataset._is_mmap
     pin = (device != 'cpu')
-    num_workers = min(4, os.cpu_count() or 1) if len(train_dataset) > 1000 else 0
+    num_workers = 0 if is_mmap else (min(4, os.cpu_count() or 1) if len(train_dataset) > 1000 else 0)
+    collate = _collate_mmap_bitboard if is_mmap else None
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin, persistent_workers=(num_workers > 0),
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=(num_workers > 0), collate_fn=collate,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size * 2, shuffle=False,
-        num_workers=num_workers, pin_memory=pin, persistent_workers=(num_workers > 0),
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=(num_workers > 0), collate_fn=collate,
     )
 
     print(f"\nTraining samples: {len(train_dataset)}")
