@@ -28,6 +28,7 @@ from chess_board import ChessBoard
 from play_chess import ChessAI, PLAY_STYLES, STYLE_RANDOM
 
 logger = logging.getLogger(__name__)
+_DIRTY = object()  # sentinel: forces canvas redraw on next update_display
 
 # ── Sound effects (Windows only, non-blocking) ──────────────────
 if sys.platform == 'win32':
@@ -111,6 +112,7 @@ class ChessGUI:
         # AI threading state
         self._ai_thread = None
         self._ai_result = [None]
+        self._game_gen = 0  # incremented on new game to invalidate stale callbacks
 
         # Pondering state
         self._ponder_thread = None
@@ -854,17 +856,21 @@ class ChessGUI:
 
         self._ai_thread = threading.Thread(target=_run, daemon=True)
         self._ai_thread.start()
-        self._poll_ai_result()
+        self._poll_ai_result(self._game_gen)
 
-    def _poll_ai_result(self):
+    def _poll_ai_result(self, gen=None):
         """Poll for AI result every 50ms on the main thread."""
+        # Stale callback from a previous game — discard
+        if gen is not None and gen != self._game_gen:
+            return
+
         if self.game_timed_out:
             self.is_ai_thinking = False
             self.update_status()
             return
 
         if self._ai_thread is not None and self._ai_thread.is_alive():
-            self.root.after(50, self._poll_ai_result)
+            self.root.after(50, lambda: self._poll_ai_result(gen))
             return
 
         move = self._ai_result[0]
@@ -1018,6 +1024,8 @@ class ChessGUI:
             self.game_timed_out = False
             self._clock_color = chess.WHITE
 
+            self._game_gen += 1  # invalidate stale poll callbacks
+            self._ai_result = [None]
             self.board = ChessBoard()
             self.selected_square = None
             self.legal_moves = []
@@ -1025,13 +1033,16 @@ class ChessGUI:
             self.is_ai_thinking = False
             # Clear AI transposition table for the new game
             self.ai.transposition_table.clear()
-            # Reset canvas dirty-check state
-            self._prev_highlights = [[None] * 8 for _ in range(8)]
-            self._prev_pieces = [[None] * 8 for _ in range(8)]
-            # Reset move history cache
+            # Reset canvas dirty-check state (use sentinel to force full redraw)
+            self._prev_highlights = [[_DIRTY] * 8 for _ in range(8)]
+            self._prev_pieces = [[_DIRTY] * 8 for _ in range(8)]
+            # Reset move history cache and clear the text widget
             self._hist_len = 0
             self._hist_san = []
             self._hist_board = chess.Board()
+            self.history_text.config(state=tk.NORMAL)
+            self.history_text.delete(1.0, tk.END)
+            self.history_text.config(state=tk.DISABLED)
             # Reset cached timer state
             self._last_white_text = None
             self._last_black_text = None

@@ -27,9 +27,6 @@ wheels/
 *.pth
 *.pt
 
-# Models directory
-models/
-
 # IDE
 .vscode/
 .idea/
