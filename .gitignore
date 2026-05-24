@@ -34,11 +34,22 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+# Windows accidental reserved-name file
+NUL
+nul
+
+# Testing
+.pytest_cache/
 
 # Jupyter
 .ipynb_checkpoints/
 
 # Logs
 *.log
-data
+# Local datasets and downloads (PGN, training npz, etc.)
+/data/
+
+# Training: per-epoch weights are large — keep only what you ship (e.g. chess_model.pth)
+models/chess_model_epoch*.pth
+
 .claude

@@ -12,18 +12,34 @@ A machine learning project for learning and playing chess using neural networks.
 
 ## Project Structure
 
+Run CLI commands from the **repository root** unless noted otherwise.
+
 ```
 .
-├── main.py                  # Main entry point
-├── chess_board.py          # Chess board and game logic
-├── chess_model.py          # Neural network models
-├── train.py                # Training script
-├── play_chess.py           # Game playing interface
-├── download_pgn_data.py    # Download PGN files from pgnmentor.com
-├── parse_pgn_data.py       # Parse PGN files into training data
-├── requirements.txt        # Python dependencies
-├── README.md              # This file (English)
-└── README_VI.md           # Documentation (Vietnamese)
+├── main.py                  # Main entry point (train / play / gui)
+├── chess_board.py           # Board representation and classical evaluation
+├── chess_model.py           # CNN and policy networks
+├── train.py                 # Supervised training
+├── train_rl.py              # Self-play RL training
+├── play_chess.py            # Search engine and console play
+├── chess_gui.py             # Graphical UI
+├── setup_cy.py              # Build Cython eval (optional speedup)
+├── eval_cy.pyx              # Cython evaluation sources
+├── requirements.txt
+├── config/
+│   └── pgn_links.txt        # URLs for download_pgn_data
+├── scripts/
+│   ├── download_pgn_data.py # Download PGN zips from pgnmentor.com
+│   ├── parse_pgn_data.py    # PGN → training .npz
+│   └── show_piece_shapes.py # Debug board tensor layout
+├── notebooks/
+│   └── train_chess_ai.ipynb
+├── docs/
+│   └── README_VI.md         # Vietnamese documentation
+├── tests/                   # pytest
+├── models/                  # Saved .pth checkpoints (git: main + best)
+├── images/                  # Piece sprites for GUI
+└── data/                    # Local: PGN, training_data.npz (not in git)
 ```
 
 ## Installation
@@ -42,7 +58,7 @@ A machine learning project for learning and playing chess using neural networks.
 Download PGN files from pgnmentor.com:
 
 ```bash
-python download_pgn_data.py
+python scripts/download_pgn_data.py
 ```
 
 This script will download games from top players (Carlsen, Caruana, Anand, Kasparov, etc.) and save them to `data/pgn/`.
@@ -52,17 +68,17 @@ This script will download games from top players (Carlsen, Caruana, Anand, Kaspa
 Convert PGN files into training data:
 
 ```bash
-python parse_pgn_data.py
+python scripts/parse_pgn_data.py
 ```
 
 Or with options:
 
 ```bash
 # Parse with limit on games per file
-python parse_pgn_data.py --max-games 1000
+python scripts/parse_pgn_data.py --max-games 1000
 
 # Specify PGN directory and output file
-python parse_pgn_data.py --pgn-dir data/pgn --output data/training_data.npz
+python scripts/parse_pgn_data.py --pgn-dir data/pgn --output data/training_data.npz
 ```
 
 The data will be saved to `data/training_data.npz`.
@@ -161,10 +177,10 @@ The AI uses the **minimax algorithm** with **alpha-beta pruning**:
 
 ```bash
 # 1. Download data
-python download_pgn_data.py
+python scripts/download_pgn_data.py
 
 # 2. Parse data
-python parse_pgn_data.py
+python scripts/parse_pgn_data.py
 
 # 3. Train model
 python train.py

@@ -88,15 +88,13 @@ class ChessBoard:
         board_array = np.zeros((8, 8, 12), dtype=np.float32)
         bb = self.board
 
-        # Vectorized: extract each piece-type bitboard directly
         for channel, (piece_type, color) in enumerate(_PIECE_CHANNELS):
             mask = int(bb.pieces(piece_type, color))
             if mask == 0:
                 continue
-            # Extract set bit positions
             squares = _bb_to_squares(mask)
-            rows = 7 - (squares >> 3)   # 7 - rank (flip for display)
-            cols = squares & 7          # file
+            rows = 7 - (squares >> 3)
+            cols = squares & 7
             board_array[rows, cols, channel] = 1.0
 
         return board_array

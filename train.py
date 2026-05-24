@@ -368,8 +368,8 @@ def run_training(
     if not has_npy and not os.path.exists(data_path):
         print(f"\nError: Training data not found at {data_path} or {data_dir}/positions.npy")
         print("Please run:")
-        print("  1. python download_pgn_data.py")
-        print("  2. python parse_pgn_data.py")
+        print("  1. python scripts/download_pgn_data.py")
+        print("  2. python scripts/parse_pgn_data.py")
         return
 
     positions, evaluations = load_training_data_from_file(data_path)
